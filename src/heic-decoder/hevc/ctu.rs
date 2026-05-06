@@ -15,12 +15,14 @@ const DEBUG_TRACE: bool = false;
 
 /// Debug print macro gated behind DEBUG_TRACE const
 macro_rules! debug_trace {
-    ($($arg:tt)*) => {
+    ($($arg:tt)*) => {{
         #[cfg(feature = "std")]
         if DEBUG_TRACE {
             eprintln!($($arg)*);
         }
-    };
+        #[cfg(not(feature = "std"))]
+        let _ = format_args!($($arg)*);
+    }};
 }
 
 use super::cabac::{CabacDecoder, ContextModel, INIT_VALUES, context};

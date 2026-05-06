@@ -18,14 +18,14 @@ This document is the practical API reference for integrating `heic_decoder` in a
 
 ```toml
 [dependencies]
-heic_decoder = { path = "../heic" }
+heic_decoder = { path = "../heic-decoder" }
 ```
 
 With `image` integration:
 
 ```toml
 [dependencies]
-heic_decoder = { path = "../heic", features = ["image-integration"] }
+heic_decoder = { path = "../heic-decoder", features = ["image-integration"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ```
 

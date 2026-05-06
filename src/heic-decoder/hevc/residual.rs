@@ -10,10 +10,12 @@ use crate::heic_decoder::error::HevcError;
 
 /// Residual trace output, only available with std feature
 macro_rules! rc_eprintln {
-    ($($arg:tt)*) => {
+    ($($arg:tt)*) => {{
         #[cfg(feature = "std")]
         eprintln!($($arg)*);
-    };
+        #[cfg(not(feature = "std"))]
+        let _ = format_args!($($arg)*);
+    }};
 }
 
 type Result<T> = core::result::Result<T, HevcError>;

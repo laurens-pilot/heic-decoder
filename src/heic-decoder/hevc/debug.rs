@@ -173,6 +173,8 @@ pub fn compare_coeffs(
             eprintln!("  ... and {} more", diffs.len() - 10);
         }
     }
+    #[cfg(not(feature = "std"))]
+    let _ = context;
 
     diffs
 }

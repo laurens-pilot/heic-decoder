@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Pure Rust HEIF/HEIC/AVIF decoder with image crate integration hooks"
 readme = "README.md"
+license-file = "LICENSE"
+repository = "https://github.com/ente-io/heic-decoder"
 
 [features]
 default = ["std"]

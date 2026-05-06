@@ -5935,20 +5935,19 @@ fn read_selected_top_level_boxes_from_source<S: RandomAccessSource>(
         if let Some(selected_index) = selected_types
             .iter()
             .position(|kind| *kind == header.box_type)
+            && !found[selected_index]
         {
-            if !found[selected_index] {
-                let box_bytes = source
-                    .read_range(cursor, box_size_usize)
-                    .map_err(decode_error_from_source_read_error)?;
-                selected.push(SourceTopLevelBox {
-                    offset: cursor,
-                    header,
-                    bytes: box_bytes,
-                });
-                found[selected_index] = true;
-                if found.iter().all(|value| *value) {
-                    break;
-                }
+            let box_bytes = source
+                .read_range(cursor, box_size_usize)
+                .map_err(decode_error_from_source_read_error)?;
+            selected.push(SourceTopLevelBox {
+                offset: cursor,
+                header,
+                bytes: box_bytes,
+            });
+            found[selected_index] = true;
+            if found.iter().all(|value| *value) {
+                break;
             }
         }
 
@@ -6041,14 +6040,14 @@ pub struct DecodeGuardrails {
 
 impl DecodeGuardrails {
     fn enforce_input_bytes(&self, actual_bytes: u64) -> Result<(), DecodeError> {
-        if let Some(max_input_bytes) = self.max_input_bytes {
-            if actual_bytes > max_input_bytes {
-                return Err(DecodeGuardrailError::InputTooLarge {
-                    actual_bytes,
-                    max_input_bytes,
-                }
-                .into());
+        if let Some(max_input_bytes) = self.max_input_bytes
+            && actual_bytes > max_input_bytes
+        {
+            return Err(DecodeGuardrailError::InputTooLarge {
+                actual_bytes,
+                max_input_bytes,
             }
+            .into());
         }
         Ok(())
     }

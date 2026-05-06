@@ -2,7 +2,7 @@
 //!
 //! Enable the `image-integration` feature to:
 //! - register HEIF/HEIC/AVIF decoder hooks for `image::ImageReader`
-//! - convert [`DecodedRgbaImage`](crate::DecodedRgbaImage) into `image` buffers
+//! - convert [`DecodedRgbaImage`] into `image` buffers
 //!   and `DynamicImage` values.
 //!
 //! See `API.md` in the crate root for end-to-end examples.

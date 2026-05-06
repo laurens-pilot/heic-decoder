@@ -382,13 +382,13 @@ impl TempFileSpoolSource {
                         requested: bytes_read,
                     },
                 )?;
-                if let Some(max_allowed) = options.max_spool_bytes {
-                    if attempted > max_allowed {
-                        return Err(SourceReadError::SpoolLimitExceeded {
-                            attempted,
-                            max_allowed,
-                        });
-                    }
+                if let Some(max_allowed) = options.max_spool_bytes
+                    && attempted > max_allowed
+                {
+                    return Err(SourceReadError::SpoolLimitExceeded {
+                        attempted,
+                        max_allowed,
+                    });
                 }
                 spool_file
                     .write_all(&buffer[..bytes_read])
