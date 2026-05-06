@@ -12,6 +12,11 @@ default = ["std"]
 image-integration = ["dep:image"]
 std = ["archmage/std"]
 
+[[bin]]
+name = "heif-image-adapter-bench"
+path = "src/bin/heif-image-adapter-bench.rs"
+required-features = ["image-integration"]
+
 [dependencies]
 archmage = { version = "0.8", default-features = false, features = [
     "macros",

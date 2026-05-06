@@ -30,14 +30,14 @@ Pure Rust HEIF/HEIC/AVIF decoder with first-class `image` crate integration.
 
 ```toml
 [dependencies]
-heic_decoder = { path = "../heic" }
+heic_decoder = { path = "../heic-decoder" }
 ```
 
 With `image` integration:
 
 ```toml
 [dependencies]
-heic_decoder = { path = "../heic", features = ["image-integration"] }
+heic_decoder = { path = "../heic-decoder", features = ["image-integration"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ```
 
@@ -153,13 +153,13 @@ fn decode_with_image(path: &str) -> image::ImageResult<image::DynamicImage> {
 Build:
 
 ```bash
-cargo build --manifest-path heic_decoder/Cargo.toml --release --bin heif-decode
+cargo build --release --bin heif-decode
 ```
 
 Usage:
 
 ```bash
-heic_decoder/target/release/heif-decode \
+target/release/heif-decode \
   --max-input-bytes 134217728 \
   --max-pixels 64000000 \
   --max-temp-spool-bytes 134217728 \
