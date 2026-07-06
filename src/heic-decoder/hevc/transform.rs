@@ -668,13 +668,20 @@ pub fn dequantize(coeffs: &mut [i16], params: DequantParams) {
     let shift = params.bit_depth as i32 - 9 + params.log2_tr_size as i32;
     let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
 
-    if shift >= 0 {
+    if shift >= 0 && combined_scale <= 32767 {
         incant!(dequantize(coeffs, combined_scale, shift, add), [v3]);
+    } else if shift >= 0 {
+        // Large scale (high QP at high bit depth): coef * scale overflows
+        // i32, evaluate in i64 (mirrors libde265's int64 fallback).
+        for coef in coeffs.iter_mut() {
+            let value = (*coef as i64 * combined_scale as i64 + add as i64) >> shift;
+            *coef = value.clamp(-32768, 32767) as i16;
+        }
     } else {
         // Negative shift (left shift) — rare, keep scalar
         let neg_shift = -shift;
         for coef in coeffs.iter_mut() {
-            let value = (*coef as i32 * combined_scale) << neg_shift;
+            let value = (*coef as i64 * combined_scale as i64) << neg_shift;
             *coef = value.clamp(-32768, 32767) as i16;
         }
     }
@@ -696,8 +703,11 @@ pub fn dequantize_scaled(coeffs: &mut [i16], params: DequantParams, scaling_matr
 
     if bd_shift >= 0 {
         for (i, coef) in coeffs.iter_mut().enumerate() {
-            let m = scaling_matrix.get(i).copied().unwrap_or(16) as i32;
-            let value = (*coef as i32 * m * level_scale * (1 << qp_per) + add) >> bd_shift;
+            let m = scaling_matrix.get(i).copied().unwrap_or(16) as i64;
+            // i64: m (up to 255) * levelScale (72) << qp_per overflows i32
+            // already at moderate QPs (libde265 uses int64 here too).
+            let value =
+                (*coef as i64 * m * level_scale as i64 * (1i64 << qp_per) + add as i64) >> bd_shift;
             *coef = value.clamp(-32768, 32767) as i16;
         }
     } else {

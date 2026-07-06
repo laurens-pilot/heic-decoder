@@ -1329,7 +1329,11 @@ pub(crate) fn add_residual_block_v3(
                 _mm256_loadu_si256::<[u16; 16]>(row[offset..offset + 16].try_into().unwrap());
             let res =
                 _mm256_loadu_si256::<[i16; 16]>(res_row[offset..offset + 16].try_into().unwrap());
-            let sum = _mm256_add_epi16(pred, res);
+            // Saturating add: pred + res can exceed i16 (e.g. large positive
+            // residual on a bright sample); wrapping would clamp to 0 instead
+            // of max_val. Saturation at ±32768 preserves clamp semantics for
+            // bit depths <= 14.
+            let sum = _mm256_adds_epi16(pred, res);
             let clamped = _mm256_min_epi16(_mm256_max_epi16(sum, zero), max_v);
             _mm256_storeu_si256::<[u16; 16]>(
                 (&mut row[offset..offset + 16]).try_into().unwrap(),

@@ -82,6 +82,7 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
     );
     frame.full_range = sps.video_full_range_flag;
     frame.matrix_coeffs = sps.matrix_coeffs;
+    frame.colour_primaries = sps.colour_primaries;
 
     // Set conformance window cropping from SPS
     // Offsets are in units of SubWidthC/SubHeightC, need to convert to luma samples
@@ -93,12 +94,21 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
             3 => (1, 1), // 4:4:4
             _ => (2, 2), // Default to 4:2:0
         };
-        frame.set_crop(
-            sps.conf_win_offset.0 * sub_width_c,  // left
-            sps.conf_win_offset.1 * sub_width_c,  // right
-            sps.conf_win_offset.2 * sub_height_c, // top
-            sps.conf_win_offset.3 * sub_height_c, // bottom
-        );
+        let crop_left = sps.conf_win_offset.0.saturating_mul(sub_width_c);
+        let crop_right = sps.conf_win_offset.1.saturating_mul(sub_width_c);
+        let crop_top = sps.conf_win_offset.2.saturating_mul(sub_height_c);
+        let crop_bottom = sps.conf_win_offset.3.saturating_mul(sub_height_c);
+        // Guard against crops that consume the whole picture (u32 underflow
+        // in cropped_width/height on malicious SPS).
+        if crop_left.saturating_add(crop_right) >= w || crop_top.saturating_add(crop_bottom) >= h {
+            return Err(HevcError::InvalidParameterSet {
+                kind: "SPS",
+                msg: alloc::format!(
+                    "conformance window ({crop_left},{crop_right},{crop_top},{crop_bottom}) exceeds picture {w}x{h}"
+                ),
+            });
+        }
+        frame.set_crop(crop_left, crop_right, crop_top, crop_bottom);
     }
 
     // Decode slice data (base layer only — skip enhancement layer NALs in L-HEVC streams)

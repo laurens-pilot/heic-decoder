@@ -6,7 +6,28 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::picture::DecodedFrame;
+use super::picture::{DEBLOCK_FLAG_BYPASS, DecodedFrame};
+
+/// Lookup for cu_transquant_bypass blocks in plane coordinates (H.265 8.7.3:
+/// SAO leaves samples of lossless CUs unmodified).
+struct BypassMap<'a> {
+    flags: &'a [u8],
+    stride: u32,
+    sub_x: u32,
+    sub_y: u32,
+}
+
+impl BypassMap<'_> {
+    #[inline]
+    fn is_bypass(&self, x: u32, y: u32) -> bool {
+        let lx = x * self.sub_x;
+        let ly = y * self.sub_y;
+        let idx = ((ly / 4) * self.stride + lx / 4) as usize;
+        self.flags
+            .get(idx)
+            .is_some_and(|f| f & DEBLOCK_FLAG_BYPASS != 0)
+    }
+}
 
 /// SAO parameters for one CTB
 #[derive(Clone, Copy, Debug, Default)]
@@ -116,6 +137,27 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
         _ => (1, 1),
     };
 
+    // Snapshot the bypass flags so lossless CUs can be exempted while the
+    // sample planes are mutably borrowed. Empty when no CU uses bypass.
+    let bypass_flags: Vec<u8> = if frame.has_bypass_blocks() {
+        frame.deblock_flags.clone()
+    } else {
+        Vec::new()
+    };
+    let bypass_stride = frame.deblock_stride;
+    let luma_bypass = (!bypass_flags.is_empty()).then_some(BypassMap {
+        flags: &bypass_flags,
+        stride: bypass_stride,
+        sub_x: 1,
+        sub_y: 1,
+    });
+    let chroma_bypass = (!bypass_flags.is_empty()).then_some(BypassMap {
+        flags: &bypass_flags,
+        stride: bypass_stride,
+        sub_x,
+        sub_y,
+    });
+
     // Process each CTB
     for ctb_y in 0..sao_map.height_ctbs {
         for ctb_x in 0..sao_map.width_ctbs {
@@ -138,6 +180,7 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
                         sao.sao_band_position[0],
                         &sao.sao_offset_val[0],
                         bit_depth,
+                        luma_bypass.as_ref(),
                     );
                 }
                 2 => {
@@ -156,6 +199,7 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
                         sao.sao_eo_class[0],
                         &sao.sao_offset_val[0],
                         bit_depth,
+                        luma_bypass.as_ref(),
                     );
                 }
                 _ => {}
@@ -183,6 +227,7 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
                             sao.sao_band_position[1],
                             &sao.sao_offset_val[1],
                             bit_depth,
+                            chroma_bypass.as_ref(),
                         );
                     }
                     2 => {
@@ -199,6 +244,7 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
                             sao.sao_eo_class[1],
                             &sao.sao_offset_val[1],
                             bit_depth,
+                            chroma_bypass.as_ref(),
                         );
                     }
                     _ => {}
@@ -217,6 +263,7 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
                             sao.sao_band_position[2],
                             &sao.sao_offset_val[2],
                             bit_depth,
+                            chroma_bypass.as_ref(),
                         );
                     }
                     2 => {
@@ -233,6 +280,7 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
                             sao.sao_eo_class[2],
                             &sao.sao_offset_val[2],
                             bit_depth,
+                            chroma_bypass.as_ref(),
                         );
                     }
                     _ => {}
@@ -304,6 +352,7 @@ fn apply_sao_band_inplace(
     band_position: u8,
     offsets: &[i8; 4],
     bit_depth: u8,
+    bypass: Option<&BypassMap<'_>>,
 ) {
     let max_val = (1i32 << bit_depth) - 1;
     let band_shift = bit_depth - 5;
@@ -318,6 +367,9 @@ fn apply_sao_band_inplace(
     for y in y_start..y_end {
         let row = (y * stride) as usize;
         for x in x_start..x_end {
+            if bypass.is_some_and(|b| b.is_bypass(x, y)) {
+                continue;
+            }
             let idx = row + x as usize;
             let sample = (plane[idx] as i32).min(max_val);
             let band = (sample >> band_shift) as usize;
@@ -344,6 +396,7 @@ fn apply_sao_edge(
     eo_class: u8,
     offsets: &[i8; 4],
     bit_depth: u8,
+    bypass: Option<&BypassMap<'_>>,
 ) {
     let max_val = (1i32 << bit_depth) - 1;
     let (dx0, dy0, dx1, dy1) = EO_OFFSETS[eo_class as usize & 3];
@@ -372,6 +425,9 @@ fn apply_sao_edge(
     for y in safe_y_start..safe_y_end {
         let row = y as usize * stride_u;
         for x in safe_x_start..safe_x_end {
+            if bypass.is_some_and(|b| b.is_bypass(x, y)) {
+                continue;
+            }
             let idx = row + x as usize;
             let sample = src[idx] as i32;
             let n0_idx = (idx as isize + dy0_s + dx0_u) as usize;
@@ -395,6 +451,9 @@ fn apply_sao_edge(
         if y >= safe_y_start && y < safe_y_end {
             let row = y as usize * stride_u;
             for x in x_start..safe_x_start.min(x_end) {
+                if bypass.is_some_and(|b| b.is_bypass(x, y)) {
+                    continue;
+                }
                 apply_sao_edge_pixel(
                     src,
                     dst,
@@ -412,6 +471,9 @@ fn apply_sao_edge(
                 );
             }
             for x in safe_x_end.max(x_start)..x_end {
+                if bypass.is_some_and(|b| b.is_bypass(x, y)) {
+                    continue;
+                }
                 apply_sao_edge_pixel(
                     src,
                     dst,
@@ -431,6 +493,9 @@ fn apply_sao_edge(
         } else {
             let row = y as usize * stride_u;
             for x in x_start..x_end {
+                if bypass.is_some_and(|b| b.is_bypass(x, y)) {
+                    continue;
+                }
                 apply_sao_edge_pixel(
                     src,
                     dst,

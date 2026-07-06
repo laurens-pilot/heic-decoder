@@ -76,6 +76,7 @@ impl DecodedFrame {
             alpha_plane,
             full_range: self.full_range,
             matrix_coeffs: self.matrix_coeffs,
+            colour_primaries: self.colour_primaries,
         }
     }
 
@@ -146,6 +147,7 @@ impl DecodedFrame {
             alpha_plane,
             full_range: self.full_range,
             matrix_coeffs: self.matrix_coeffs,
+            colour_primaries: self.colour_primaries,
         }
     }
 
@@ -219,6 +221,7 @@ impl DecodedFrame {
             alpha_plane,
             full_range: self.full_range,
             matrix_coeffs: self.matrix_coeffs,
+            colour_primaries: self.colour_primaries,
         }
     }
 
@@ -284,6 +287,7 @@ impl DecodedFrame {
             alpha_plane,
             full_range: self.full_range,
             matrix_coeffs: self.matrix_coeffs,
+            colour_primaries: self.colour_primaries,
         }
     }
 
@@ -349,6 +353,7 @@ impl DecodedFrame {
             alpha_plane,
             full_range: self.full_range,
             matrix_coeffs: self.matrix_coeffs,
+            colour_primaries: self.colour_primaries,
         }
     }
 }
