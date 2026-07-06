@@ -194,6 +194,11 @@ pub struct NalUnit<'a> {
     pub nuh_temporal_id_plus1: u8,
     /// NAL unit payload (after header, emulation bytes removed)
     pub payload: Vec<u8>,
+    /// Positions of removed emulation prevention bytes, expressed as byte
+    /// offsets into the transmitted payload (i.e. `raw_data[2..]`, before
+    /// removal). Needed to convert slice-header entry point offsets, which
+    /// count transmitted bytes, into offsets into `payload`.
+    pub skipped_byte_positions: Vec<u32>,
     /// Raw data reference
     pub raw_data: &'a [u8],
 }
@@ -337,20 +342,25 @@ fn parse_nal_header(raw_data: &[u8]) -> Result<NalUnit<'_>> {
     }
 
     // Remove emulation prevention bytes (0x00 0x00 0x03 -> 0x00 0x00)
-    let payload = remove_emulation_prevention(&raw_data[2..]);
+    let (payload, skipped_byte_positions) = remove_emulation_prevention(&raw_data[2..]);
 
     Ok(NalUnit {
         nal_type,
         nuh_layer_id,
         nuh_temporal_id_plus1,
         payload,
+        skipped_byte_positions,
         raw_data,
     })
 }
 
-/// Remove emulation prevention bytes (0x03) from RBSP
-fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
+/// Remove emulation prevention bytes (0x03) from RBSP.
+///
+/// Returns the stripped payload plus the positions of the removed 0x03 bytes
+/// in the input (transmitted) byte coordinates.
+fn remove_emulation_prevention(data: &[u8]) -> (Vec<u8>, Vec<u32>) {
     let mut result = Vec::with_capacity(data.len());
+    let mut skipped = Vec::new();
     let mut i = 0;
 
     while i < data.len() {
@@ -358,6 +368,7 @@ fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
             // Emulation prevention byte found
             result.push(0);
             result.push(0);
+            skipped.push((i + 2) as u32);
             i += 3; // Skip the 0x03
         } else {
             result.push(data[i]);
@@ -365,7 +376,7 @@ fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
         }
     }
 
-    result
+    (result, skipped)
 }
 
 /// Bitstream reader for parsing RBSP data
