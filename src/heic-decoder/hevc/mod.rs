@@ -119,8 +119,30 @@ fn decode_slice(
 ) -> Result<()> {
     // 1. Parse slice header and get data offset
     let parse_result = slice::SliceHeader::parse(nal, sps, pps)?;
-    let slice_header = parse_result.header;
+    let mut slice_header = parse_result.header;
     let data_offset = parse_result.data_offset;
+
+    // Entry point offsets count transmitted bytes (including emulation
+    // prevention bytes), but the CABAC decoder reads the stripped payload.
+    // Subtract the number of emulation prevention bytes removed from the slice
+    // data before each entry point (mirrors libde265
+    // NAL_unit::num_skipped_bytes_before + decctx entry point adjustment).
+    if !slice_header.entry_point_offsets.is_empty() && !nal.skipped_byte_positions.is_empty() {
+        let header_len = data_offset as u32;
+        for offset in slice_header.entry_point_offsets.iter_mut() {
+            let skipped = nal
+                .skipped_byte_positions
+                .iter()
+                .filter(|&&pos| pos >= header_len && pos - header_len <= *offset)
+                .count() as u32;
+            if skipped > *offset {
+                return Err(HevcError::InvalidBitstream(
+                    "entry point offset smaller than removed emulation prevention bytes",
+                ));
+            }
+            *offset -= skipped;
+        }
+    }
 
     // Verify this is an I-slice (required for HEIC still images)
     if !slice_header.slice_type.is_intra() {
