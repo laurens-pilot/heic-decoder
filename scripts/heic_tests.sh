@@ -16,6 +16,11 @@ LIBHEIF_RECONFIGURE="${LIBHEIF_RECONFIGURE:-0}"
 LIBHEIF_REQUIRE_ORACLE_DECODERS="${LIBHEIF_REQUIRE_ORACLE_DECODERS:-1}"
 LIBHEIF_PATHS_RESOLVED=0
 
+ENTE_FIXTURES_EXPLICIT="${HEIC_ENTE_FIXTURES_DIR+x}"
+ENTE_FIXTURES_DIR="${HEIC_ENTE_FIXTURES_DIR:-$ASSET_ROOT/ente-test-fixtures}"
+ENTE_FIXTURES_REPO_URL="${HEIC_ENTE_FIXTURES_REPO_URL:-https://github.com/ente/test-fixtures.git}"
+ENTE_FIXTURES_SUBDIR="media/heic/v1/files"
+
 usage() {
   cat <<'EOF'
 Usage: scripts/heic_tests.sh <command> [options]
@@ -32,6 +37,9 @@ Commands:
 Common environment:
   HEIC_LIBHEIF_SOURCE_DIR  external validator checkout with examples/tests/fuzz corpus
                            default: .heic-test-assets/libheif
+  HEIC_ENTE_FIXTURES_DIR   ente test-fixtures checkout providing the HEIC fixture corpus
+                           default: .heic-test-assets/ente-test-fixtures
+                           (auto-fetched via sparse git clone when missing)
   HEIC_TEST_ROOT           generated outputs/cache root
                            default: .heic-test-runs
   LIBHEIF_BUILD_DIR        validator CMake build dir
@@ -613,6 +621,46 @@ build_libheif_decoder() {
   fi
 }
 
+ente_fixtures_files_dir() {
+  printf '%s\n' "$ENTE_FIXTURES_DIR/$ENTE_FIXTURES_SUBDIR"
+}
+
+is_ente_fixtures_files_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 1
+  find "$dir" -type f \( -iname '*.heif' -o -iname '*.heic' -o -iname '*.avif' \) -print -quit 2>/dev/null | grep -q .
+}
+
+# The ente test-fixtures HEIC corpus is part of the default corpus. It is
+# fetched on demand into the gitignored asset directory (sparse clone of only
+# the HEIC fixture subtree) and never checked into this repository. Best
+# effort: if it is missing and cannot be fetched, a warning is printed and the
+# default corpus falls back to the libheif dirs only.
+ensure_ente_fixtures() {
+  local files_dir
+  files_dir="$(ente_fixtures_files_dir)"
+  if is_ente_fixtures_files_dir "$files_dir"; then
+    return 0
+  fi
+
+  if [[ -n "$ENTE_FIXTURES_EXPLICIT" || -e "$ENTE_FIXTURES_DIR" ]]; then
+    log fixtures "WARNING: no HEIC fixture files under $files_dir; continuing without the ente fixtures corpus" >&2
+    return 1
+  fi
+
+  log fixtures "Fetching ente test-fixtures HEIC corpus into $ENTE_FIXTURES_DIR" >&2
+  if ! command -v git >/dev/null 2>&1 \
+    || ! git clone --quiet --depth 1 --filter=blob:none --no-checkout \
+          "$ENTE_FIXTURES_REPO_URL" "$ENTE_FIXTURES_DIR" >&2 \
+    || ! git -C "$ENTE_FIXTURES_DIR" sparse-checkout set "$ENTE_FIXTURES_SUBDIR" >&2 \
+    || ! git -C "$ENTE_FIXTURES_DIR" checkout --quiet >&2 \
+    || ! is_ente_fixtures_files_dir "$files_dir"; then
+    rm -rf "$ENTE_FIXTURES_DIR"
+    log fixtures "WARNING: could not fetch $ENTE_FIXTURES_REPO_URL; continuing without the ente fixtures corpus" >&2
+    return 1
+  fi
+}
+
 default_corpus_dirs() {
   resolve_libheif_paths
 
@@ -623,6 +671,9 @@ default_corpus_dirs() {
     "$LIBHEIF_SOURCE_DIR/examples" \
     "$LIBHEIF_SOURCE_DIR/tests/data" \
     "$LIBHEIF_SOURCE_DIR/fuzzing/data/corpus"
+  if ensure_ente_fixtures; then
+    ente_fixtures_files_dir
+  fi
 }
 
 gather_files() {
