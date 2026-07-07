@@ -200,9 +200,16 @@ impl<'a> SliceContext<'a> {
         let qp_i_cb = slice_qp + pps.pps_cb_qp_offset as i32 + header.slice_cb_qp_offset as i32;
         let qp_i_cr = slice_qp + pps.pps_cr_qp_offset as i32 + header.slice_cr_qp_offset as i32;
 
-        // Apply chroma QP mapping table (H.265 Table 8-10)
-        let qp_cb = chroma_qp_mapping(qp_i_cb.clamp(0, 57));
-        let qp_cr = chroma_qp_mapping(qp_i_cr.clamp(0, 57));
+        // Apply chroma QP mapping table (H.265 Table 8-10, 4:2:0 only; for
+        // 4:2:2/4:4:4 the spec uses QpC = Min(qPi, 51))
+        let (qp_cb, qp_cr) = if sps.chroma_format_idc == 1 {
+            (
+                chroma_qp_mapping(qp_i_cb.clamp(0, 57)),
+                chroma_qp_mapping(qp_i_cr.clamp(0, 57)),
+            )
+        } else {
+            (qp_i_cb.clamp(0, 51), qp_i_cr.clamp(0, 51))
+        };
 
         debug_trace!(
             "DEBUG: Chroma QP: qp_y={}, qp_cb={}, qp_cr={}",
@@ -375,6 +382,12 @@ impl<'a> SliceContext<'a> {
                 } else {
                     self.cabac.reinit();
                 }
+                // H.265 9.3.1: when the picture is one CTB wide, the sync CTB
+                // (top-right) is unavailable, so context variables are fully
+                // re-initialized at each row start (no snapshot to restore).
+                if pic_width_in_ctbs == 1 {
+                    self.reinit_context_models();
+                }
             }
 
             // Check for end of picture
@@ -491,7 +504,14 @@ impl<'a> SliceContext<'a> {
                         self.sps.bit_depth_c() as u32
                     };
                     let c_max = (1u32 << (bit_depth.min(10) - 5)) - 1;
-                    let offset_scale = 1i32 << (bit_depth.saturating_sub(bit_depth.min(10)));
+                    // H.265 7.4.9.3: SaoOffsetVal is scaled by the PPS range
+                    // extension's log2_sao_offset_scale (default 0).
+                    let log2_offset_scale = if c_idx == 0 {
+                        self.pps.log2_sao_offset_scale_luma
+                    } else {
+                        self.pps.log2_sao_offset_scale_chroma
+                    };
+                    let offset_scale = 1i32 << log2_offset_scale;
 
                     let mut offsets_abs = [0u32; 4];
                     for elem in &mut offsets_abs {
@@ -872,11 +892,27 @@ impl<'a> SliceContext<'a> {
                     self.derive_intra_luma_mode(x0 + half, y0 + half, prev_flags[3])?;
                 self.store_intra_mode(x0 + half, y0 + half, log2_pu_size, luma_mode_3);
 
-                // Decode chroma mode once (using first luma mode for derivation if mode=4)
-                let chroma_mode = self.decode_intra_chroma_mode(luma_mode_0)?;
-
-                // Store chroma mode for the whole CU region
-                self.store_intra_chroma_mode(x0, y0, log2_cb_size, chroma_mode);
+                // Decode chroma mode(s). For 4:4:4 (ChromaArrayType 3) one
+                // chroma mode is coded per PU (H.265 7.3.8.5); otherwise a
+                // single mode covers the CU.
+                let chroma_mode = if self.sps.chroma_format_idc == 3
+                    && !self.sps.separate_colour_plane_flag
+                {
+                    let c0 = self.decode_intra_chroma_mode(luma_mode_0)?;
+                    self.store_intra_chroma_mode(x0, y0, log2_pu_size, c0);
+                    let c1 = self.decode_intra_chroma_mode(luma_mode_1)?;
+                    self.store_intra_chroma_mode(x0 + half, y0, log2_pu_size, c1);
+                    let c2 = self.decode_intra_chroma_mode(luma_mode_2)?;
+                    self.store_intra_chroma_mode(x0, y0 + half, log2_pu_size, c2);
+                    let c3 = self.decode_intra_chroma_mode(luma_mode_3)?;
+                    self.store_intra_chroma_mode(x0 + half, y0 + half, log2_pu_size, c3);
+                    c0
+                } else {
+                    let chroma_mode = self.decode_intra_chroma_mode(luma_mode_0)?;
+                    // Store chroma mode for the whole CU region
+                    self.store_intra_chroma_mode(x0, y0, log2_cb_size, chroma_mode);
+                    chroma_mode
+                };
 
                 // NOTE: Prediction is NOT done here. It happens in decode_transform_unit_leaf
                 // and the 8x8→4x4 chroma split handler, so each TU is predicted →
@@ -890,34 +926,35 @@ impl<'a> SliceContext<'a> {
             }
         };
 
-        // Decode rqt_root_cbf (residual quad-tree coded block flag)
-        // For intra, this is always coded (not signaled, assumed 1)
-        // unless transquant_bypass is enabled
-        if !self.cu_transquant_bypass_flag {
-            // Decode transform tree
-            let intra_split_flag = part_mode == PartMode::PartNxN;
-            self.decode_transform_tree(
+        // Decode the transform tree. Per H.265 7.3.8.5 it is parsed for intra
+        // CUs regardless of cu_transquant_bypass_flag; the bypass flag only
+        // disables scaling/transform (handled in decode_and_apply_residual)
+        // and in-loop filtering (handled via the frame's bypass map).
+        if self.cu_transquant_bypass_flag {
+            frame.store_block_bypass(x0, y0, cb_size);
+        }
+        let intra_split_flag = part_mode == PartMode::PartNxN;
+        self.decode_transform_tree(
+            x0,
+            y0,
+            log2_cb_size,
+            0, // trafo_depth
+            intra_luma_mode,
+            intra_chroma_mode,
+            intra_split_flag,
+            frame,
+        )?;
+
+        if self.debug_ctu {
+            let (r, o) = self.cabac.get_state();
+            debug_trace!(
+                "  CTU37: After transform_tree at ({},{}) log2={} (r={},o={})",
                 x0,
                 y0,
                 log2_cb_size,
-                0, // trafo_depth
-                intra_luma_mode,
-                intra_chroma_mode,
-                intra_split_flag,
-                frame,
-            )?;
-
-            if self.debug_ctu {
-                let (r, o) = self.cabac.get_state();
-                debug_trace!(
-                    "  CTU37: After transform_tree at ({},{}) log2={} (r={},o={})",
-                    x0,
-                    y0,
-                    log2_cb_size,
-                    r,
-                    o
-                );
-            }
+                r,
+                o
+            );
         }
 
         Ok(())
@@ -1211,7 +1248,8 @@ impl<'a> SliceContext<'a> {
         // This ensures each TU reads reconstructed neighbors from prior TUs
         intra::predict_intra(frame, x0, y0, log2_size, actual_luma_mode, 0, sis);
 
-        let scan_order = residual::get_scan_order(log2_size, actual_luma_mode.as_u8(), 0);
+        let scan_order =
+            residual::get_scan_order(log2_size, actual_luma_mode.as_u8(), 0, self.sps.chroma_format_idc);
 
         // Decode and apply luma residuals (adds to prediction already in frame)
         if cbf_luma {
@@ -1356,24 +1394,11 @@ impl<'a> SliceContext<'a> {
                 )?;
             }
             3 => {
-                self.decode_chroma_block(
-                    x0,
-                    y0,
-                    log2_size,
-                    1,
-                    cbf_cb & 1 != 0,
-                    intra_chroma_mode,
-                    frame,
-                )?;
-                self.decode_chroma_block(
-                    x0,
-                    y0,
-                    log2_size,
-                    2,
-                    cbf_cr & 1 != 0,
-                    intra_chroma_mode,
-                    frame,
-                )?;
+                // 4:4:4 codes one chroma mode per PU; look it up at this TB
+                // position instead of using the CU-level mode.
+                let mode = self.get_intra_chroma_mode_at(x0, y0);
+                self.decode_chroma_block(x0, y0, log2_size, 1, cbf_cb & 1 != 0, mode, frame)?;
+                self.decode_chroma_block(x0, y0, log2_size, 2, cbf_cr & 1 != 0, mode, frame)?;
             }
             _ => {}
         }
@@ -1391,7 +1416,12 @@ impl<'a> SliceContext<'a> {
         frame: &mut DecodedFrame,
     ) -> Result<()> {
         let sis = self.sps.strong_intra_smoothing_enabled_flag;
-        let scan_order = residual::get_scan_order(log2_size, intra_chroma_mode.as_u8(), c_idx);
+        let scan_order = residual::get_scan_order(
+            log2_size,
+            intra_chroma_mode.as_u8(),
+            c_idx,
+            self.sps.chroma_format_idc,
+        );
         intra::predict_intra(frame, x0, y0, log2_size, intra_chroma_mode, c_idx, sis);
         if cbf {
             self.decode_and_apply_residual(x0, y0, log2_size, c_idx, scan_order, frame)?;
@@ -1458,15 +1488,25 @@ impl<'a> SliceContext<'a> {
         let size = 1usize << log2_size;
         let num_coeffs = size * size;
 
-        // Dequantize coefficients in-place
-        let coeffs = &mut coeff_buf.coeffs;
-
         let (qp, bit_depth) = match c_idx {
             0 => (self.qp_y, self.sps.bit_depth_y()),
             1 => (self.qp_cb, self.sps.bit_depth_c()),
             2 => (self.qp_cr, self.sps.bit_depth_c()),
             _ => (self.qp_y, self.sps.bit_depth_y()),
         };
+
+        // cu_transquant_bypass (H.265 8.6.4.1): the coefficients ARE the
+        // residual — no scaling, no inverse transform.
+        if self.cu_transquant_bypass_flag {
+            let residual = &mut self.residual_buf;
+            residual[..num_coeffs].copy_from_slice(&coeff_buf.coeffs[..num_coeffs]);
+            self.add_residual_to_plane(x0, y0, log2_size, c_idx, bit_depth, frame);
+            return Ok(());
+        }
+
+        // Dequantize coefficients in-place
+        let coeffs = &mut coeff_buf.coeffs;
+
         let dequant_params = transform::DequantParams {
             qp,
             bit_depth,
@@ -1474,15 +1514,19 @@ impl<'a> SliceContext<'a> {
         };
 
         // Use scaling list if enabled (H.265 8.6.3)
-        // Per spec: use PPS scaling list if present, else SPS scaling list
-        let scaling_list = if self.sps.scaling_list_enabled_flag && !transform_skip {
-            self.pps
-                .pps_scaling_list
-                .as_ref()
-                .or(self.sps.scaling_list.as_ref())
-        } else {
-            None
-        };
+        // Per spec: use PPS scaling list if present, else SPS scaling list.
+        // m[x][y] is flat only when scaling lists are off or when
+        // transform_skip is used with nTbS > 4; 4x4 transform-skip blocks
+        // still use the scaling factors.
+        let scaling_list =
+            if self.sps.scaling_list_enabled_flag && !(transform_skip && log2_size > 2) {
+                self.pps
+                    .pps_scaling_list
+                    .as_ref()
+                    .or(self.sps.scaling_list.as_ref())
+            } else {
+                None
+            };
 
         if let Some(sl) = scaling_list {
             // matrixId: intra Y=0, Cb=1, Cr=2 (all HEIC is intra)
@@ -1528,7 +1572,24 @@ impl<'a> SliceContext<'a> {
             transform::inverse_transform(coeffs, residual, size, bit_depth, is_intra_4x4_luma);
         }
 
-        // Add residual to prediction — single SIMD dispatch for entire block
+        self.add_residual_to_plane(x0, y0, log2_size, c_idx, bit_depth, frame);
+
+        Ok(())
+    }
+
+    /// Add `self.residual_buf` to the prediction already in the plane,
+    /// clamping to the component bit depth.
+    fn add_residual_to_plane(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        c_idx: u8,
+        bit_depth: u8,
+        frame: &mut DecodedFrame,
+    ) {
+        let size = 1usize << log2_size;
+        let residual = &self.residual_buf;
         let max_val = (1i32 << bit_depth) - 1;
         let (plane, stride) = frame.plane_mut(c_idx);
         let last_row_end = (y0 as usize + size - 1) * stride + x0 as usize + size;
@@ -1558,8 +1619,6 @@ impl<'a> SliceContext<'a> {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Decode partition mode
@@ -1608,6 +1667,14 @@ impl<'a> SliceContext<'a> {
         // reconstructed before the next TU reads its neighbors.
 
         Ok((intra_luma_mode, intra_chroma_mode))
+    }
+
+    /// Re-initialize all CABAC context models from the slice QP (H.265 9.3.1)
+    fn reinit_context_models(&mut self) {
+        let slice_qp = self.header.slice_qp_y;
+        for (i, init_val) in INIT_VALUES.iter().enumerate() {
+            self.ctx[i].init(*init_val, slice_qp);
+        }
     }
 
     /// Decode prev_intra_luma_pred_flag (context-coded bin)
@@ -1997,8 +2064,18 @@ impl<'a> SliceContext<'a> {
             (qpy + self.pps.pps_cr_qp_offset as i32 + self.header.slice_cr_qp_offset as i32)
                 .clamp(-qp_bd_offset_c, 57);
 
-        self.qp_cb = Self::chroma_qp_from_luma(qpi_cb) + qp_bd_offset_c;
-        self.qp_cr = Self::chroma_qp_from_luma(qpi_cr) + qp_bd_offset_c;
+        // H.265 8.6.1: the Table 8-10 mapping applies to 4:2:0 only; for
+        // 4:2:2/4:4:4 QpC = Min(qPi, 51).
+        let (qp_cb_mapped, qp_cr_mapped) = if self.sps.chroma_format_idc == 1 {
+            (
+                Self::chroma_qp_from_luma(qpi_cb),
+                Self::chroma_qp_from_luma(qpi_cr),
+            )
+        } else {
+            (qpi_cb.min(51), qpi_cr.min(51))
+        };
+        self.qp_cb = qp_cb_mapped + qp_bd_offset_c;
+        self.qp_cr = qp_cr_mapped + qp_bd_offset_c;
 
         self.current_qpy = qpy;
     }

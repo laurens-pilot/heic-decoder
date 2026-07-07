@@ -90,6 +90,8 @@ pub struct Sps {
     pub num_short_term_ref_pic_sets: u8,
     /// Long-term reference pictures present flag
     pub long_term_ref_pics_present_flag: bool,
+    /// Number of long-term reference pictures signalled in the SPS
+    pub num_long_term_ref_pics_sps: u32,
     /// Temporal MVP enabled flag
     pub sps_temporal_mvp_enabled_flag: bool,
     /// Strong intra smoothing enabled flag
@@ -100,6 +102,12 @@ pub struct Sps {
     pub video_full_range_flag: bool,
     /// Matrix coefficients (from VUI). 1=BT.709, 5/6=BT.601, 9=BT.2020
     pub matrix_coeffs: u8,
+    /// Colour primaries (from VUI). 2=unspecified
+    pub colour_primaries: u8,
+    /// First enabled SPS range-extension coding tool that the decoder does
+    /// not implement (None when the stream uses none). Checked at decode
+    /// time so metadata-only parsing stays capability-agnostic.
+    pub unsupported_rext_tool: Option<&'static str>,
 }
 
 impl Sps {
@@ -259,12 +267,12 @@ impl ScalingListData {
         match size_id {
             0 => {
                 // 4x4: direct lookup via diagonal scan
-                let idx = DIAG_SCAN_4X4_INV[y as usize][x as usize];
+                let idx = DIAG_SCAN_4X4_INV[x as usize][y as usize];
                 self.lists[0][mid][idx]
             }
             1 => {
                 // 8x8: direct lookup via diagonal scan
-                let idx = DIAG_SCAN_8X8_INV[y as usize][x as usize];
+                let idx = DIAG_SCAN_8X8_INV[x as usize][y as usize];
                 self.lists[1][mid][idx]
             }
             2 => {
@@ -274,7 +282,7 @@ impl ScalingListData {
                 }
                 let rx = (x / 2) as usize;
                 let ry = (y / 2) as usize;
-                let idx = DIAG_SCAN_8X8_INV[ry][rx];
+                let idx = DIAG_SCAN_8X8_INV[rx][ry];
                 self.lists[2][mid][idx]
             }
             3 => {
@@ -284,7 +292,7 @@ impl ScalingListData {
                 }
                 let rx = (x / 4) as usize;
                 let ry = (y / 4) as usize;
-                let idx = DIAG_SCAN_8X8_INV[ry][rx];
+                let idx = DIAG_SCAN_8X8_INV[rx][ry];
                 self.lists[3][mid][idx]
             }
             _ => 16,
@@ -292,7 +300,9 @@ impl ScalingListData {
     }
 }
 
-/// Inverse diagonal scan for 4x4: DIAG_SCAN_4X4_INV[y][x] = scan_index
+/// Inverse up-right diagonal scan for 4x4 (H.265 6.5.3):
+/// DIAG_SCAN_4X4_INV[x][y] = scan_index of position (x, y).
+/// Scan index 1 is at (x=0, y=1) — the scan walks anti-diagonals upward.
 #[rustfmt::skip]
 static DIAG_SCAN_4X4_INV: [[usize; 4]; 4] = [
     [ 0,  1,  3,  6],
@@ -301,7 +311,7 @@ static DIAG_SCAN_4X4_INV: [[usize; 4]; 4] = [
     [ 9, 12, 14, 15],
 ];
 
-/// Inverse diagonal scan for 8x8: DIAG_SCAN_8X8_INV[y][x] = scan_index
+/// Inverse up-right diagonal scan for 8x8: DIAG_SCAN_8X8_INV[x][y] = scan_index
 #[rustfmt::skip]
 static DIAG_SCAN_8X8_INV: [[usize; 8]; 8] = [
     [ 0,  1,  3,  6, 10, 15, 21, 28],
@@ -386,6 +396,10 @@ pub struct Pps {
     pub log2_parallel_merge_level_minus2: u8,
     /// Slice segment header extension present flag
     pub slice_segment_header_extension_present_flag: bool,
+    /// SAO offset scale for luma (PPS range extension, default 0)
+    pub log2_sao_offset_scale_luma: u8,
+    /// SAO offset scale for chroma (PPS range extension, default 0)
+    pub log2_sao_offset_scale_chroma: u8,
 }
 
 /// Tile configuration
@@ -556,14 +570,23 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
     };
 
     let num_short_term_ref_pic_sets = reader.read_ue()? as u8;
-    // Skip short term ref pic sets (not needed for still images)
+    // Skip short term ref pic sets (not needed for still images), tracking
+    // NumDeltaPocs so inter-RPS-predicted sets consume the right bit count.
+    let mut num_delta_pocs: Vec<u32> = Vec::with_capacity(num_short_term_ref_pic_sets as usize);
     for i in 0..num_short_term_ref_pic_sets {
-        skip_short_term_ref_pic_set(&mut reader, i, num_short_term_ref_pic_sets)?;
+        let n = skip_short_term_ref_pic_set(&mut reader, i, &num_delta_pocs)?;
+        num_delta_pocs.push(n);
     }
 
     let long_term_ref_pics_present_flag = reader.read_bit()? != 0;
+    let mut num_long_term_ref_pics_sps = 0u32;
     if long_term_ref_pics_present_flag {
-        let num_long_term_ref_pics_sps = reader.read_ue()?;
+        num_long_term_ref_pics_sps = reader.read_ue()?;
+        if num_long_term_ref_pics_sps > 32 {
+            return Err(HevcError::InvalidBitstream(
+                "num_long_term_ref_pics_sps out of range",
+            ));
+        }
         for _ in 0..num_long_term_ref_pics_sps {
             let _lt_ref_pic_poc_lsb_sps =
                 reader.read_bits(log2_max_pic_order_cnt_lsb_minus4 + 4)?;
@@ -579,6 +602,7 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
     // Parse VUI color parameters if present
     let mut video_full_range_flag = false; // default: limited range
     let mut matrix_coeffs = 2u8; // default: unspecified
+    let mut colour_primaries = 2u8; // default: unspecified
     if vui_parameters_present_flag {
         let aspect_ratio_info_present = reader.read_bit()? != 0;
         if aspect_ratio_info_present {
@@ -599,12 +623,54 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
             video_full_range_flag = reader.read_bit()? != 0;
             let colour_description_present = reader.read_bit()? != 0;
             if colour_description_present {
-                let _colour_primaries = reader.read_bits(8)?;
+                colour_primaries = reader.read_bits(8)? as u8;
                 let _transfer_characteristics = reader.read_bits(8)?;
                 matrix_coeffs = reader.read_bits(8)? as u8;
             }
         }
-        // Don't parse the rest of VUI — we only need color info
+        // Skip the rest of VUI so the SPS extension flags that follow can be
+        // parsed (they carry coding tools that change decoded output).
+        skip_vui_remainder(&mut reader, max_sub_layers_minus1)?;
+    }
+
+    // SPS extensions (H.265 7.3.2.2.1)
+    let mut unsupported_rext_tool: Option<&'static str> = None;
+    let sps_extension_present_flag = reader.read_bit()? != 0;
+    if sps_extension_present_flag {
+        let sps_range_extension_flag = reader.read_bit()? != 0;
+        let _sps_multilayer_extension_flag = reader.read_bit()? != 0;
+        let _sps_3d_extension_flag = reader.read_bit()? != 0;
+        let _sps_scc_extension_flag = reader.read_bit()? != 0;
+        let _sps_extension_4bits = reader.read_bits(4)?;
+
+        if sps_range_extension_flag {
+            // Range-extension coding tools change bitstream syntax and/or
+            // reconstruction; none are implemented. Record the first enabled
+            // one so the decoder can reject it loudly (parsing stays
+            // capability-agnostic for metadata-only callers).
+            let names: [&'static str; 9] = [
+                "transform_skip_rotation_enabled_flag",
+                "transform_skip_context_enabled_flag",
+                "implicit_rdpcm_enabled_flag",
+                "explicit_rdpcm_enabled_flag",
+                "extended_precision_processing_flag",
+                "intra_smoothing_disabled_flag",
+                "high_precision_offsets_enabled_flag",
+                "persistent_rice_adaptation_enabled_flag",
+                "cabac_bypass_alignment_enabled_flag",
+            ];
+            for name in names {
+                let flag = reader.read_bit()? != 0;
+                // high_precision_offsets only affects inter weighted
+                // prediction, which still images never use.
+                if flag
+                    && name != "high_precision_offsets_enabled_flag"
+                    && unsupported_rext_tool.is_none()
+                {
+                    unsupported_rext_tool = Some(name);
+                }
+            }
+        }
     }
 
     Ok(Sps {
@@ -637,11 +703,14 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
         pcm_params,
         num_short_term_ref_pic_sets,
         long_term_ref_pics_present_flag,
+        num_long_term_ref_pics_sps,
         sps_temporal_mvp_enabled_flag,
         strong_intra_smoothing_enabled_flag,
         vui_parameters_present_flag,
         video_full_range_flag,
         matrix_coeffs,
+        colour_primaries,
+        unsupported_rext_tool,
     })
 }
 
@@ -699,6 +768,13 @@ pub fn parse_pps(data: &[u8]) -> Result<Pps> {
 
         let loop_filter_across_tiles_enabled_flag = reader.read_bit()? != 0;
 
+        // The CTB decode loop walks raster order with WPP-only entry point
+        // handling; multi-tile pictures would silently desync CABAC. Reject
+        // them loudly until tile-scan decoding is implemented.
+        if num_tile_columns_minus1 > 0 || num_tile_rows_minus1 > 0 {
+            return Err(HevcError::Unsupported("PPS with multiple tiles"));
+        }
+
         Some(TileInfo {
             num_tile_columns_minus1,
             num_tile_rows_minus1,
@@ -743,6 +819,51 @@ pub fn parse_pps(data: &[u8]) -> Result<Pps> {
     let log2_parallel_merge_level_minus2 = reader.read_ue()? as u8;
     let slice_segment_header_extension_present_flag = reader.read_bit()? != 0;
 
+    // PPS extensions (H.265 7.3.2.3.1). The range extension carries fields
+    // that change decoded output; parse it so they are honored or rejected
+    // rather than silently ignored.
+    let mut log2_sao_offset_scale_luma = 0u8;
+    let mut log2_sao_offset_scale_chroma = 0u8;
+    let pps_extension_present_flag = reader.read_bit().unwrap_or(0) != 0;
+    if pps_extension_present_flag {
+        let pps_range_extension_flag = reader.read_bit()? != 0;
+        let _pps_multilayer_extension_flag = reader.read_bit()? != 0;
+        let _pps_3d_extension_flag = reader.read_bit()? != 0;
+        let _pps_scc_extension_flag = reader.read_bit()? != 0;
+        let _pps_extension_4bits = reader.read_bits(4)?;
+
+        if pps_range_extension_flag {
+            if transform_skip_enabled_flag {
+                let log2_max_transform_skip_block_size_minus2 = reader.read_ue()?;
+                if log2_max_transform_skip_block_size_minus2 > 0 {
+                    return Err(HevcError::Unsupported(
+                        "transform skip for blocks larger than 4x4",
+                    ));
+                }
+            }
+            let cross_component_prediction_enabled_flag = reader.read_bit()? != 0;
+            if cross_component_prediction_enabled_flag {
+                return Err(HevcError::Unsupported("cross-component prediction"));
+            }
+            let chroma_qp_offset_list_enabled_flag = reader.read_bit()? != 0;
+            if chroma_qp_offset_list_enabled_flag {
+                return Err(HevcError::Unsupported("chroma QP offset lists"));
+            }
+            log2_sao_offset_scale_luma = reader.read_ue()? as u8;
+            log2_sao_offset_scale_chroma = reader.read_ue()? as u8;
+            // Spec bound is Max(0, bitDepth-10); the SAO offset storage (i8)
+            // holds scaled offsets up to 31<<2, covering 12-bit content.
+            if log2_sao_offset_scale_luma > 2 || log2_sao_offset_scale_chroma > 2 {
+                return Err(HevcError::InvalidParameterSet {
+                    kind: "PPS",
+                    msg: alloc::format!(
+                        "log2_sao_offset_scale out of range: {log2_sao_offset_scale_luma}/{log2_sao_offset_scale_chroma}"
+                    ),
+                });
+            }
+        }
+    }
+
     Ok(Pps {
         pps_id,
         sps_id,
@@ -778,6 +899,8 @@ pub fn parse_pps(data: &[u8]) -> Result<Pps> {
         lists_modification_present_flag,
         log2_parallel_merge_level_minus2,
         slice_segment_header_extension_present_flag,
+        log2_sao_offset_scale_luma,
+        log2_sao_offset_scale_chroma,
     })
 }
 
@@ -882,11 +1005,127 @@ fn parse_scaling_list_data(reader: &mut BitstreamReader<'_>) -> Result<ScalingLi
     Ok(data)
 }
 
+/// Skip the VUI fields after the colour description (H.265 E.2.1).
+fn skip_vui_remainder(
+    reader: &mut BitstreamReader<'_>,
+    max_sub_layers_minus1: u8,
+) -> Result<()> {
+    let chroma_loc_info_present_flag = reader.read_bit()? != 0;
+    if chroma_loc_info_present_flag {
+        let _chroma_sample_loc_type_top_field = reader.read_ue()?;
+        let _chroma_sample_loc_type_bottom_field = reader.read_ue()?;
+    }
+    let _neutral_chroma_indication_flag = reader.read_bit()?;
+    let _field_seq_flag = reader.read_bit()?;
+    let _frame_field_info_present_flag = reader.read_bit()?;
+    let default_display_window_flag = reader.read_bit()? != 0;
+    if default_display_window_flag {
+        let _def_disp_win_left_offset = reader.read_ue()?;
+        let _def_disp_win_right_offset = reader.read_ue()?;
+        let _def_disp_win_top_offset = reader.read_ue()?;
+        let _def_disp_win_bottom_offset = reader.read_ue()?;
+    }
+    let vui_timing_info_present_flag = reader.read_bit()? != 0;
+    if vui_timing_info_present_flag {
+        let _vui_num_units_in_tick = reader.read_bits(32)?;
+        let _vui_time_scale = reader.read_bits(32)?;
+        let vui_poc_proportional_to_timing_flag = reader.read_bit()? != 0;
+        if vui_poc_proportional_to_timing_flag {
+            let _vui_num_ticks_poc_diff_one_minus1 = reader.read_ue()?;
+        }
+        let vui_hrd_parameters_present_flag = reader.read_bit()? != 0;
+        if vui_hrd_parameters_present_flag {
+            skip_hrd_parameters(reader, max_sub_layers_minus1)?;
+        }
+    }
+    let bitstream_restriction_flag = reader.read_bit()? != 0;
+    if bitstream_restriction_flag {
+        let _tiles_fixed_structure_flag = reader.read_bit()?;
+        let _motion_vectors_over_pic_boundaries_flag = reader.read_bit()?;
+        let _restricted_ref_pic_lists_flag = reader.read_bit()?;
+        let _min_spatial_segmentation_idc = reader.read_ue()?;
+        let _max_bytes_per_pic_denom = reader.read_ue()?;
+        let _max_bits_per_min_cu_denom = reader.read_ue()?;
+        let _log2_max_mv_length_horizontal = reader.read_ue()?;
+        let _log2_max_mv_length_vertical = reader.read_ue()?;
+    }
+    Ok(())
+}
+
+/// Skip `hrd_parameters(1, maxNumSubLayersMinus1)` (H.265 E.2.2).
+fn skip_hrd_parameters(reader: &mut BitstreamReader<'_>, max_sub_layers_minus1: u8) -> Result<()> {
+    let nal_hrd_parameters_present_flag = reader.read_bit()? != 0;
+    let vcl_hrd_parameters_present_flag = reader.read_bit()? != 0;
+    let mut sub_pic_hrd_params_present_flag = false;
+    if nal_hrd_parameters_present_flag || vcl_hrd_parameters_present_flag {
+        sub_pic_hrd_params_present_flag = reader.read_bit()? != 0;
+        if sub_pic_hrd_params_present_flag {
+            let _tick_divisor_minus2 = reader.read_bits(8)?;
+            let _du_cpb_removal_delay_increment_length_minus1 = reader.read_bits(5)?;
+            let _sub_pic_cpb_params_in_pic_timing_sei_flag = reader.read_bit()?;
+            let _dpb_output_delay_du_length_minus1 = reader.read_bits(5)?;
+        }
+        let _bit_rate_scale = reader.read_bits(4)?;
+        let _cpb_size_scale = reader.read_bits(4)?;
+        if sub_pic_hrd_params_present_flag {
+            let _cpb_size_du_scale = reader.read_bits(4)?;
+        }
+        let _initial_cpb_removal_delay_length_minus1 = reader.read_bits(5)?;
+        let _au_cpb_removal_delay_length_minus1 = reader.read_bits(5)?;
+        let _dpb_output_delay_length_minus1 = reader.read_bits(5)?;
+    }
+    for _ in 0..=max_sub_layers_minus1 {
+        let fixed_pic_rate_general_flag = reader.read_bit()? != 0;
+        let fixed_pic_rate_within_cvs_flag = if !fixed_pic_rate_general_flag {
+            reader.read_bit()? != 0
+        } else {
+            true
+        };
+        let low_delay_hrd_flag = if fixed_pic_rate_within_cvs_flag {
+            let _elemental_duration_in_tc_minus1 = reader.read_ue()?;
+            false
+        } else {
+            reader.read_bit()? != 0
+        };
+        let cpb_cnt_minus1 = if !low_delay_hrd_flag {
+            let n = reader.read_ue()?;
+            if n > 31 {
+                return Err(HevcError::InvalidBitstream("cpb_cnt_minus1 out of range"));
+            }
+            n
+        } else {
+            0
+        };
+        for hrd_present in [
+            nal_hrd_parameters_present_flag,
+            vcl_hrd_parameters_present_flag,
+        ] {
+            if hrd_present {
+                for _ in 0..=cpb_cnt_minus1 {
+                    let _bit_rate_value_minus1 = reader.read_ue()?;
+                    let _cpb_size_value_minus1 = reader.read_ue()?;
+                    if sub_pic_hrd_params_present_flag {
+                        let _cpb_size_du_value_minus1 = reader.read_ue()?;
+                        let _bit_rate_du_value_minus1 = reader.read_ue()?;
+                    }
+                    let _cbr_flag = reader.read_bit()?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Skip one `st_ref_pic_set` in the SPS, returning its NumDeltaPocs.
+///
+/// `prev_num_delta_pocs[i]` holds NumDeltaPocs of the already-parsed sets;
+/// inter-RPS-predicted sets reference the previous set (delta_idx is not
+/// signalled inside the SPS loop) and code NumDeltaPocs[ref]+1 flag pairs.
 fn skip_short_term_ref_pic_set(
     reader: &mut BitstreamReader<'_>,
     idx: u8,
-    _num_sets: u8,
-) -> Result<()> {
+    prev_num_delta_pocs: &[u32],
+) -> Result<u32> {
     let inter_ref_pic_set_prediction_flag = if idx != 0 {
         reader.read_bit()? != 0
     } else {
@@ -894,16 +1133,38 @@ fn skip_short_term_ref_pic_set(
     };
 
     if inter_ref_pic_set_prediction_flag {
-        // Simplified - skip inter prediction
-        if idx == _num_sets {
-            let _delta_idx_minus1 = reader.read_ue()?;
-        }
+        // Inside the SPS loop delta_idx_minus1 is not present (inferred 0),
+        // so the reference set is always the immediately preceding one.
+        let ref_num_delta_pocs = *prev_num_delta_pocs
+            .last()
+            .ok_or(HevcError::InvalidBitstream(
+                "inter-predicted st_ref_pic_set without a previous set",
+            ))?;
         let _delta_rps_sign = reader.read_bit()?;
         let _abs_delta_rps_minus1 = reader.read_ue()?;
-        // Would need previous set info to properly parse
+        let mut num_delta_pocs = 0u32;
+        for _ in 0..=ref_num_delta_pocs {
+            let used_by_curr_pic_flag = reader.read_bit()? != 0;
+            let use_delta_flag = if !used_by_curr_pic_flag {
+                reader.read_bit()? != 0
+            } else {
+                true
+            };
+            if used_by_curr_pic_flag || use_delta_flag {
+                num_delta_pocs += 1;
+            }
+        }
+        Ok(num_delta_pocs)
     } else {
         let num_negative_pics = reader.read_ue()?;
         let num_positive_pics = reader.read_ue()?;
+        // Bound the loop to keep corrupt streams from spinning on huge ue(v)
+        // values; conformant streams keep these within DPB limits (<= 16).
+        if num_negative_pics > 4096 || num_positive_pics > 4096 {
+            return Err(HevcError::InvalidBitstream(
+                "st_ref_pic_set pic count out of range",
+            ));
+        }
         for _ in 0..num_negative_pics {
             let _delta_poc_s0_minus1 = reader.read_ue()?;
             let _used_by_curr_pic_s0_flag = reader.read_bit()?;
@@ -912,7 +1173,6 @@ fn skip_short_term_ref_pic_set(
             let _delta_poc_s1_minus1 = reader.read_ue()?;
             let _used_by_curr_pic_s1_flag = reader.read_bit()?;
         }
+        Ok(num_negative_pics + num_positive_pics)
     }
-
-    Ok(())
 }

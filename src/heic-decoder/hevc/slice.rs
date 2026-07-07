@@ -281,6 +281,14 @@ impl SliceHeader {
             return Err(HevcError::Unsupported("dependent slice segments"));
         }
 
+        // Multi-slice pictures are rejected loudly: SAO merge availability,
+        // qPY prediction and the per-picture loop filters all assume a single
+        // slice covering the frame, so decoding further slices would produce
+        // silently wrong pixels.
+        if !first_slice_segment_in_pic_flag || slice_segment_address != 0 {
+            return Err(HevcError::Unsupported("multi-slice pictures"));
+        }
+
         // Skip reserved bits
         for _ in 0..pps.num_extra_slice_header_bits {
             reader.read_bit()?;
@@ -393,9 +401,22 @@ impl SliceHeader {
         let (num_entry_point_offsets, entry_point_offsets) =
             if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
                 let n = reader.read_ue()?;
+                // Bound: with tiles limited to 1x1, entry points only come
+                // from WPP, at most one per CTB row after the first.
+                if n >= sps.pic_height_in_ctbs() {
+                    return Err(HevcError::InvalidBitstream(
+                        "num_entry_point_offsets out of range",
+                    ));
+                }
                 let mut offsets = Vec::with_capacity(n as usize);
                 if n > 0 {
-                    let offset_len = reader.read_ue()? as u8 + 1;
+                    let offset_len_minus1 = reader.read_ue()?;
+                    if offset_len_minus1 > 31 {
+                        return Err(HevcError::InvalidBitstream(
+                            "offset_len_minus1 out of range",
+                        ));
+                    }
+                    let offset_len = offset_len_minus1 as u8 + 1;
                     let mut cumulative = 0u32;
                     for _ in 0..n {
                         let offset = reader
@@ -485,9 +506,11 @@ fn skip_ref_pic_set(reader: &mut BitstreamReader<'_>, sps: &Sps) -> Result<()> {
 
         for i in 0..(num_long_term_sps + num_long_term_pics) {
             if i < num_long_term_sps {
-                // lt_idx_sps - bits depend on num_long_term_ref_pics_sps
-                // For simplicity, skip
-                reader.read_ue()?;
+                // lt_idx_sps: u(Ceil(Log2(num_long_term_ref_pics_sps)))
+                let bits = ceil_log2(sps.num_long_term_ref_pics_sps);
+                if bits > 0 {
+                    reader.read_bits(bits)?;
+                }
             } else {
                 reader.read_bits(poc_bits)?; // poc_lsb_lt
                 reader.read_bit()?; // used_by_curr_pic_lt_flag

@@ -33,14 +33,20 @@ pub enum ScanOrder {
 
 /// Get scan order based on intra prediction mode and component index.
 ///
-/// Per H.265 Table 6-5:
+/// Per H.265 7.4.9.11 (scanIdx derivation):
 /// - Luma: directional scan at log2_size 2 (4x4) and 3 (8x8)
-/// - Chroma: directional scan at log2_size 2 only
-pub fn get_scan_order(log2_size: u8, intra_mode: u8, c_idx: u8) -> ScanOrder {
+/// - Chroma: directional scan at log2_size 2, and also at log2_size 3 when
+///   ChromaArrayType == 3 (4:4:4)
+pub fn get_scan_order(
+    log2_size: u8,
+    intra_mode: u8,
+    c_idx: u8,
+    chroma_format_idc: u8,
+) -> ScanOrder {
     let use_directional = if c_idx == 0 {
         log2_size == 2 || log2_size == 3
     } else {
-        log2_size == 2
+        log2_size == 2 || (log2_size == 3 && chroma_format_idc == 3)
     };
 
     if use_directional {
@@ -1153,12 +1159,26 @@ fn decode_coeff_abs_level_remaining(
         };
         ((prefix << rice_param) + suffix) as i16
     } else {
+        // Conformant streams keep values within CoeffMax (32767), bounding
+        // prefix-3+rice at 14 bits. Larger prefixes only arise from corrupt
+        // or desynced data; error out instead of wrapping silently.
+        if prefix - 3 + rice_param as u32 > 14 {
+            return Err(HevcError::InvalidBitstream(
+                "coeff_abs_level_remaining out of range",
+            ));
+        }
         // EGk part: suffix bits = prefix - 3 + rice_param
         let suffix_bits = (prefix - 3 + rice_param as u32) as u8;
         let suffix = cabac.decode_bypass_bits(suffix_bits)?;
         // value = (((1 << (prefix-3)) + 3 - 1) << rice_param) + suffix
         let base = ((1u32 << (prefix - 3)) + 2) << rice_param;
-        (base + suffix) as i16
+        let v = base + suffix;
+        if v > 32767 {
+            return Err(HevcError::InvalidBitstream(
+                "coeff_abs_level_remaining out of range",
+            ));
+        }
+        v as i16
     };
 
     // Update rice parameter: if baseLevel + value > 3 * (1 << rice_param), increase

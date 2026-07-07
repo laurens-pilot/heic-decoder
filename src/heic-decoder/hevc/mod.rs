@@ -57,6 +57,26 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
     let sps = sps.ok_or(HevcError::MissingParameterSet("SPS"))?;
     let pps = pps.ok_or(HevcError::MissingParameterSet("PPS"))?;
 
+    // Capability checks live here rather than in the SPS parser so that
+    // metadata-only callers can still read dimensions/bit depths of valid
+    // streams this decoder cannot decode.
+    if sps.pcm_enabled_flag {
+        // pcm_flag is not decoded in the CU layer; with PCM enabled every
+        // eligible CU codes that bin, so continuing would desync CABAC and
+        // produce silent garbage.
+        return Err(HevcError::Unsupported("IPCM (pcm_enabled_flag)"));
+    }
+    if sps.chroma_format_idc != 0 && sps.bit_depth_chroma_minus8 != sps.bit_depth_luma_minus8 {
+        // The pipeline (intra clamps, deblock/SAO scaling, output conversion)
+        // assumes one bit depth for all planes.
+        return Err(HevcError::Unsupported(
+            "different luma and chroma bit depths",
+        ));
+    }
+    if let Some(tool) = sps.unsupported_rext_tool {
+        return Err(HevcError::Unsupported(tool));
+    }
+
     // Sanity-check dimensions before allocating (prevent OOM from malicious SPS)
     let w = sps.pic_width_in_luma_samples;
     let h = sps.pic_height_in_luma_samples;
@@ -82,6 +102,7 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
     );
     frame.full_range = sps.video_full_range_flag;
     frame.matrix_coeffs = sps.matrix_coeffs;
+    frame.colour_primaries = sps.colour_primaries;
 
     // Set conformance window cropping from SPS
     // Offsets are in units of SubWidthC/SubHeightC, need to convert to luma samples
@@ -93,12 +114,21 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
             3 => (1, 1), // 4:4:4
             _ => (2, 2), // Default to 4:2:0
         };
-        frame.set_crop(
-            sps.conf_win_offset.0 * sub_width_c,  // left
-            sps.conf_win_offset.1 * sub_width_c,  // right
-            sps.conf_win_offset.2 * sub_height_c, // top
-            sps.conf_win_offset.3 * sub_height_c, // bottom
-        );
+        let crop_left = sps.conf_win_offset.0.saturating_mul(sub_width_c);
+        let crop_right = sps.conf_win_offset.1.saturating_mul(sub_width_c);
+        let crop_top = sps.conf_win_offset.2.saturating_mul(sub_height_c);
+        let crop_bottom = sps.conf_win_offset.3.saturating_mul(sub_height_c);
+        // Guard against crops that consume the whole picture (u32 underflow
+        // in cropped_width/height on malicious SPS).
+        if crop_left.saturating_add(crop_right) >= w || crop_top.saturating_add(crop_bottom) >= h {
+            return Err(HevcError::InvalidParameterSet {
+                kind: "SPS",
+                msg: alloc::format!(
+                    "conformance window ({crop_left},{crop_right},{crop_top},{crop_bottom}) exceeds picture {w}x{h}"
+                ),
+            });
+        }
+        frame.set_crop(crop_left, crop_right, crop_top, crop_bottom);
     }
 
     // Decode slice data (base layer only — skip enhancement layer NALs in L-HEVC streams)
@@ -123,17 +153,32 @@ fn decode_slice(
     let data_offset = parse_result.data_offset;
 
     // Entry point offsets count transmitted bytes (including emulation
-    // prevention bytes), but the CABAC decoder reads the stripped payload.
-    // Subtract the number of emulation prevention bytes removed from the slice
-    // data before each entry point (mirrors libde265
-    // NAL_unit::num_skipped_bytes_before + decctx entry point adjustment).
+    // prevention bytes), but the CABAC decoder reads the stripped payload, so
+    // each offset shrinks by the number of EPBs removed from the slice data
+    // before it. skipped_byte_positions are transmitted-payload coordinates
+    // while data_offset is a stripped-payload offset; an EPB's would-be
+    // stripped position is its transmitted position minus the number of EPBs
+    // removed before it, which classifies slice-header EPBs exactly. The
+    // upper bound is strict: an EPB sitting exactly at a substream start
+    // shifts that substream's first real byte into the removed byte's
+    // stripped slot, so it must not be counted. (libde265 compares mixed
+    // coordinates with an inclusive bound here; both differences only show
+    // for EPBs at the header tail or exactly on a substream boundary.)
     if !slice_header.entry_point_offsets.is_empty() && !nal.skipped_byte_positions.is_empty() {
-        let header_len = data_offset as u32;
+        // Positions are ascending, so header EPBs (stripped position before
+        // data_offset) form a prefix: pos - index < data_offset.
+        let header_epbs = nal
+            .skipped_byte_positions
+            .iter()
+            .enumerate()
+            .take_while(|&(index, &pos)| (pos as usize) < data_offset + index)
+            .count();
+        let slice_data_start = (data_offset + header_epbs) as u32;
         for offset in slice_header.entry_point_offsets.iter_mut() {
             let skipped = nal
                 .skipped_byte_positions
                 .iter()
-                .filter(|&&pos| pos >= header_len && pos - header_len <= *offset)
+                .filter(|&&pos| pos >= slice_data_start && pos - slice_data_start < *offset)
                 .count() as u32;
             if skipped > *offset {
                 return Err(HevcError::InvalidBitstream(

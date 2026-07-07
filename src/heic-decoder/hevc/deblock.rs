@@ -136,6 +136,23 @@ fn filter_edge_luma(
     let bit_depth = frame.bit_depth as i32;
     let max_val = (1i32 << bit_depth) - 1;
 
+    // H.265 8.7.2.5.7: samples in cu_transquant_bypass (lossless) CUs are not
+    // modified by deblocking; suppress writes per side.
+    let (p_bypass, q_bypass) = if vertical {
+        (
+            frame.is_block_bypass(x.wrapping_sub(1), y),
+            frame.is_block_bypass(x, y),
+        )
+    } else {
+        (
+            frame.is_block_bypass(x, y.wrapping_sub(1)),
+            frame.is_block_bypass(x, y),
+        )
+    };
+    if p_bypass && q_bypass {
+        return;
+    }
+
     // For I-slices, bS is always 2 at boundaries
     let bs = 2i32;
 
@@ -264,12 +281,16 @@ fn filter_edge_luma(
                 .clamp(q2 - tc2, q2 + tc2)
                 .clamp(0, max_val);
 
-            plane[base_p + k_off] = p0_f as u16;
-            plane[base_p + k_off - step_across] = p1_f as u16;
-            plane[base_p + k_off - 2 * step_across] = p2_f as u16;
-            plane[base_q + k_off] = q0_f as u16;
-            plane[base_q + k_off + step_across] = q1_f as u16;
-            plane[base_q + k_off + 2 * step_across] = q2_f as u16;
+            if !p_bypass {
+                plane[base_p + k_off] = p0_f as u16;
+                plane[base_p + k_off - step_across] = p1_f as u16;
+                plane[base_p + k_off - 2 * step_across] = p2_f as u16;
+            }
+            if !q_bypass {
+                plane[base_q + k_off] = q0_f as u16;
+                plane[base_q + k_off + step_across] = q1_f as u16;
+                plane[base_q + k_off + 2 * step_across] = q2_f as u16;
+            }
         } else {
             // Weak filter
             let delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
@@ -277,18 +298,23 @@ fn filter_edge_luma(
             if delta.abs() < 10 * tc {
                 let delta = delta.clamp(-tc, tc);
 
-                plane[base_p + k_off] = (p0 + delta).clamp(0, max_val) as u16;
-                plane[base_q + k_off] = (q0 - delta).clamp(0, max_val) as u16;
-
-                if d_ep {
-                    let delta_p =
-                        ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1).clamp(-(tc >> 1), tc >> 1);
-                    plane[base_p + k_off - step_across] = (p1 + delta_p).clamp(0, max_val) as u16;
+                if !p_bypass {
+                    plane[base_p + k_off] = (p0 + delta).clamp(0, max_val) as u16;
+                    if d_ep {
+                        let delta_p =
+                            ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1).clamp(-(tc >> 1), tc >> 1);
+                        plane[base_p + k_off - step_across] =
+                            (p1 + delta_p).clamp(0, max_val) as u16;
+                    }
                 }
-                if d_eq {
-                    let delta_q =
-                        ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1).clamp(-(tc >> 1), tc >> 1);
-                    plane[base_q + k_off + step_across] = (q1 + delta_q).clamp(0, max_val) as u16;
+                if !q_bypass {
+                    plane[base_q + k_off] = (q0 - delta).clamp(0, max_val) as u16;
+                    if d_eq {
+                        let delta_q =
+                            ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1).clamp(-(tc >> 1), tc >> 1);
+                        plane[base_q + k_off + step_across] =
+                            (q1 + delta_q).clamp(0, max_val) as u16;
+                    }
                 }
             }
         }
@@ -354,6 +380,15 @@ fn apply_chroma_deblocking(
                 let cx = x / sub_x;
                 let cy = y / sub_y;
 
+                // Per-sample transquant-bypass exemption (H.265 8.7.2.5.7)
+                let mut p_bypass = [false; 4];
+                let mut q_bypass = [false; 4];
+                for k in 0..4u32 {
+                    let ly = (cy + k) * sub_y;
+                    p_bypass[k as usize] = frame.is_block_bypass(x.wrapping_sub(1), ly);
+                    q_bypass[k as usize] = frame.is_block_bypass(x, ly);
+                }
+
                 for c_idx in 0..2 {
                     let qp_offset = if c_idx == 0 {
                         cb_qp_offset
@@ -361,7 +396,13 @@ fn apply_chroma_deblocking(
                         cr_qp_offset
                     };
                     let qp_i = ((qp_q + qp_p + 1) >> 1) + qp_offset;
-                    let qp_c = chroma_qp_mapping(qp_i);
+                    // Table 8-10 mapping applies to 4:2:0 only (H.265
+                    // 8.7.2.5.5); otherwise QpC = Min(qPi, 51).
+                    let qp_c = if frame.chroma_format == 1 {
+                        chroma_qp_mapping(qp_i)
+                    } else {
+                        qp_i.clamp(0, 51)
+                    };
                     let q_tc = (qp_c + 2 + tc_offset).clamp(0, 53);
                     let tc = (TC_PRIME[q_tc as usize] as i32) << (bit_depth_c - 8);
 
@@ -393,8 +434,12 @@ fn apply_chroma_deblocking(
                         let q1 = plane[base + ci + 1] as i32;
 
                         let delta = (((q0 - p0) * 4 + p1 - q1 + 4) >> 3).clamp(-tc, tc);
-                        plane[base + ci - 1] = (p0 + delta).clamp(0, max_val) as u16;
-                        plane[base + ci] = (q0 - delta).clamp(0, max_val) as u16;
+                        if !p_bypass[k as usize] {
+                            plane[base + ci - 1] = (p0 + delta).clamp(0, max_val) as u16;
+                        }
+                        if !q_bypass[k as usize] {
+                            plane[base + ci] = (q0 - delta).clamp(0, max_val) as u16;
+                        }
                     }
                 }
             }
@@ -424,6 +469,15 @@ fn apply_chroma_deblocking(
                 let cx = x / sub_x;
                 let cy = y / sub_y;
 
+                // Per-sample transquant-bypass exemption (H.265 8.7.2.5.7)
+                let mut p_bypass = [false; 4];
+                let mut q_bypass = [false; 4];
+                for k in 0..4u32 {
+                    let lx = (cx + k) * sub_x;
+                    p_bypass[k as usize] = frame.is_block_bypass(lx, y.wrapping_sub(1));
+                    q_bypass[k as usize] = frame.is_block_bypass(lx, y);
+                }
+
                 for c_idx in 0..2 {
                     let qp_offset = if c_idx == 0 {
                         cb_qp_offset
@@ -431,7 +485,13 @@ fn apply_chroma_deblocking(
                         cr_qp_offset
                     };
                     let qp_i = ((qp_q + qp_p + 1) >> 1) + qp_offset;
-                    let qp_c = chroma_qp_mapping(qp_i);
+                    // Table 8-10 mapping applies to 4:2:0 only (H.265
+                    // 8.7.2.5.5); otherwise QpC = Min(qPi, 51).
+                    let qp_c = if frame.chroma_format == 1 {
+                        chroma_qp_mapping(qp_i)
+                    } else {
+                        qp_i.clamp(0, 51)
+                    };
                     let q_tc = (qp_c + 2 + tc_offset).clamp(0, 53);
                     let tc = (TC_PRIME[q_tc as usize] as i32) << (bit_depth_c - 8);
 
@@ -464,8 +524,12 @@ fn apply_chroma_deblocking(
                         let q1 = plane[(row_q + 1) * c_stride + col] as i32;
 
                         let delta = (((q0 - p0) * 4 + p1 - q1 + 4) >> 3).clamp(-tc, tc);
-                        plane[row_p * c_stride + col] = (p0 + delta).clamp(0, max_val) as u16;
-                        plane[row_q * c_stride + col] = (q0 - delta).clamp(0, max_val) as u16;
+                        if !p_bypass[k as usize] {
+                            plane[row_p * c_stride + col] = (p0 + delta).clamp(0, max_val) as u16;
+                        }
+                        if !q_bypass[k as usize] {
+                            plane[row_q * c_stride + col] = (q0 - delta).clamp(0, max_val) as u16;
+                        }
                     }
                 }
             }

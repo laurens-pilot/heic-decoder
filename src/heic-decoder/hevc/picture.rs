@@ -14,6 +14,9 @@ pub(crate) const UNINIT_SAMPLE: u16 = u16::MAX;
 pub(crate) const DEBLOCK_FLAG_VERT: u8 = 1;
 /// Horizontal edge flag
 pub(crate) const DEBLOCK_FLAG_HORIZ: u8 = 2;
+/// Block belongs to a cu_transquant_bypass (lossless) CU: deblocking and SAO
+/// must leave its samples untouched (H.265 8.7.2.5.7 / 8.7.3)
+pub(crate) const DEBLOCK_FLAG_BYPASS: u8 = 4;
 
 /// Decoded video frame with YCbCr plane data.
 ///
@@ -49,6 +52,8 @@ pub struct DecodedFrame {
     pub full_range: bool,
     /// Matrix coefficients (from SPS VUI). 1=BT.709, 5/6=BT.601, 9=BT.2020, 2=unspecified
     pub matrix_coeffs: u8,
+    /// Colour primaries (from SPS VUI). 2=unspecified
+    pub colour_primaries: u8,
     // -- Internal fields (not part of public API) --
     /// Deblocking edge flags at 4x4 block granularity
     #[doc(hidden)]
@@ -103,6 +108,7 @@ impl DecodedFrame {
             alpha_plane: None,
             full_range: false,
             matrix_coeffs: 2,
+            colour_primaries: 2,
         }
     }
 
@@ -146,6 +152,39 @@ impl DecodedFrame {
                 }
             }
         }
+    }
+
+    /// Mark a CU region as cu_transquant_bypass at 4x4 granularity
+    pub(crate) fn store_block_bypass(&mut self, x: u32, y: u32, size: u32) {
+        let bx = x / 4;
+        let by = y / 4;
+        let bs = size / 4;
+        for j in 0..bs {
+            for i in 0..bs {
+                let idx = ((by + j) * self.deblock_stride + bx + i) as usize;
+                if idx < self.deblock_flags.len() {
+                    self.deblock_flags[idx] |= DEBLOCK_FLAG_BYPASS;
+                }
+            }
+        }
+    }
+
+    /// True if the 4x4 block containing luma position (x, y) is in a
+    /// cu_transquant_bypass CU.
+    #[inline]
+    pub(crate) fn is_block_bypass(&self, x: u32, y: u32) -> bool {
+        let idx = ((y / 4) * self.deblock_stride + x / 4) as usize;
+        self.deblock_flags
+            .get(idx)
+            .is_some_and(|f| f & DEBLOCK_FLAG_BYPASS != 0)
+    }
+
+    /// True if any block in the frame is marked cu_transquant_bypass
+    #[inline]
+    pub(crate) fn has_bypass_blocks(&self) -> bool {
+        self.deblock_flags
+            .iter()
+            .any(|f| f & DEBLOCK_FLAG_BYPASS != 0)
     }
 
     /// Set conformance window cropping
@@ -303,7 +342,6 @@ impl DecodedFrame {
         let x_start = self.crop_left;
         let x_end = self.width - self.crop_right;
 
-        let mut pixel_idx = 0usize;
         for y in y_start..y_end {
             for x in x_start..x_end {
                 let y_idx = (y * self.width + x) as usize;
@@ -316,9 +354,12 @@ impl DecodedFrame {
                 bgra.push(g);
                 bgra.push(r);
 
+                // The alpha plane is full (uncropped) frame size; index it
+                // with the same plane coordinates as luma, not the cropped
+                // output raster index.
                 let alpha = if let Some(ref alpha) = self.alpha_plane {
-                    if pixel_idx < alpha.len() {
-                        (alpha[pixel_idx] >> shift).min(255) as u8
+                    if y_idx < alpha.len() {
+                        (alpha[y_idx] >> shift).min(255) as u8
                     } else {
                         255
                     }
@@ -327,7 +368,6 @@ impl DecodedFrame {
                 };
                 bgra.push(alpha);
 
-                pixel_idx += 1;
             }
         }
 
@@ -435,16 +475,18 @@ impl DecodedFrame {
         let x_end = self.width - self.crop_right;
 
         let mut offset = 0;
-        let mut pixel_idx = 0usize;
         for y in y_start..y_end {
             for x in x_start..x_end {
                 let y_idx = (y * self.width + x) as usize;
                 let y_val = (self.y_plane[y_idx] >> shift) as i32;
                 let (cb_val, cr_val) = self.get_chroma(x, y, shift);
                 let (r, g, b) = self.ycbcr_to_rgb(y_val, cb_val, cr_val);
+                // The alpha plane is full (uncropped) frame size; index it
+                // with the same plane coordinates as luma, not the cropped
+                // output raster index.
                 let alpha = if let Some(ref alpha) = self.alpha_plane {
-                    if pixel_idx < alpha.len() {
-                        (alpha[pixel_idx] >> shift).min(255) as u8
+                    if y_idx < alpha.len() {
+                        (alpha[y_idx] >> shift).min(255) as u8
                     } else {
                         255
                     }
@@ -458,7 +500,6 @@ impl DecodedFrame {
                     output[offset + 3] = alpha;
                     offset += 4;
                 }
-                pixel_idx += 1;
             }
         }
         (out_width * out_height * 4) as usize
@@ -479,16 +520,18 @@ impl DecodedFrame {
         let x_end = self.width - self.crop_right;
 
         let mut offset = 0;
-        let mut pixel_idx = 0usize;
         for y in y_start..y_end {
             for x in x_start..x_end {
                 let y_idx = (y * self.width + x) as usize;
                 let y_val = (self.y_plane[y_idx] >> shift) as i32;
                 let (cb_val, cr_val) = self.get_chroma(x, y, shift);
                 let (r, g, b) = self.ycbcr_to_rgb(y_val, cb_val, cr_val);
+                // The alpha plane is full (uncropped) frame size; index it
+                // with the same plane coordinates as luma, not the cropped
+                // output raster index.
                 let alpha = if let Some(ref alpha) = self.alpha_plane {
-                    if pixel_idx < alpha.len() {
-                        (alpha[pixel_idx] >> shift).min(255) as u8
+                    if y_idx < alpha.len() {
+                        (alpha[y_idx] >> shift).min(255) as u8
                     } else {
                         255
                     }
@@ -502,7 +545,6 @@ impl DecodedFrame {
                     output[offset + 3] = alpha;
                     offset += 4;
                 }
-                pixel_idx += 1;
             }
         }
         (out_width * out_height * 4) as usize
@@ -556,7 +598,6 @@ impl DecodedFrame {
         let x_start = self.crop_left;
         let x_end = self.width - self.crop_right;
 
-        let mut pixel_idx = 0usize;
         for y in y_start..y_end {
             for x in x_start..x_end {
                 let y_idx = (y * self.width + x) as usize;
@@ -569,9 +610,12 @@ impl DecodedFrame {
                 rgba.push(g);
                 rgba.push(b);
 
+                // The alpha plane is full (uncropped) frame size; index it
+                // with the same plane coordinates as luma, not the cropped
+                // output raster index.
                 let alpha = if let Some(ref alpha) = self.alpha_plane {
-                    if pixel_idx < alpha.len() {
-                        (alpha[pixel_idx] >> shift).min(255) as u8
+                    if y_idx < alpha.len() {
+                        (alpha[y_idx] >> shift).min(255) as u8
                     } else {
                         255
                     }
@@ -580,7 +624,6 @@ impl DecodedFrame {
                 };
                 rgba.push(alpha);
 
-                pixel_idx += 1;
             }
         }
 
