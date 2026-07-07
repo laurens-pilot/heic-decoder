@@ -153,17 +153,32 @@ fn decode_slice(
     let data_offset = parse_result.data_offset;
 
     // Entry point offsets count transmitted bytes (including emulation
-    // prevention bytes), but the CABAC decoder reads the stripped payload.
-    // Subtract the number of emulation prevention bytes removed from the slice
-    // data before each entry point (mirrors libde265
-    // NAL_unit::num_skipped_bytes_before + decctx entry point adjustment).
+    // prevention bytes), but the CABAC decoder reads the stripped payload, so
+    // each offset shrinks by the number of EPBs removed from the slice data
+    // before it. skipped_byte_positions are transmitted-payload coordinates
+    // while data_offset is a stripped-payload offset; an EPB's would-be
+    // stripped position is its transmitted position minus the number of EPBs
+    // removed before it, which classifies slice-header EPBs exactly. The
+    // upper bound is strict: an EPB sitting exactly at a substream start
+    // shifts that substream's first real byte into the removed byte's
+    // stripped slot, so it must not be counted. (libde265 compares mixed
+    // coordinates with an inclusive bound here; both differences only show
+    // for EPBs at the header tail or exactly on a substream boundary.)
     if !slice_header.entry_point_offsets.is_empty() && !nal.skipped_byte_positions.is_empty() {
-        let header_len = data_offset as u32;
+        // Positions are ascending, so header EPBs (stripped position before
+        // data_offset) form a prefix: pos - index < data_offset.
+        let header_epbs = nal
+            .skipped_byte_positions
+            .iter()
+            .enumerate()
+            .take_while(|&(index, &pos)| (pos as usize) < data_offset + index)
+            .count();
+        let slice_data_start = (data_offset + header_epbs) as u32;
         for offset in slice_header.entry_point_offsets.iter_mut() {
             let skipped = nal
                 .skipped_byte_positions
                 .iter()
-                .filter(|&&pos| pos >= header_len && pos - header_len <= *offset)
+                .filter(|&&pos| pos >= slice_data_start && pos - slice_data_start < *offset)
                 .count() as u32;
             if skipped > *offset {
                 return Err(HevcError::InvalidBitstream(

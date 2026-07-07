@@ -4230,6 +4230,10 @@ fn apply_heic_grid_tile_transforms(
             isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture) => {
                 decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
             }
+            // A 0-degree rotation is a no-op; some muxers write the property
+            // redundantly.
+            isobmff::PrimaryItemTransformProperty::Rotation(rotation)
+                if rotation.rotation_ccw_degrees == 0 => {}
             // Per-tile rotation/mirror would require plane-level transforms
             // before pasting (libheif applies them); silently skipping them
             // scrambles tile content, so reject loudly until implemented.
@@ -6912,13 +6916,39 @@ fn write_decoded_rgba_image_to_png(
             decoded.icc_profile.as_deref(),
             output_path,
         ),
-        DecodedRgbaPixels::U16(pixels) => write_rgba16_png(
-            decoded.width,
-            decoded.height,
-            pixels,
-            decoded.icc_profile.as_deref(),
-            output_path,
-        ),
+        DecodedRgbaPixels::U16(pixels) => {
+            // The in-memory RGBA16 API uses full-range bit replication, but
+            // heif-dec's PNG writer expands samples by a plain left shift (its
+            // replication term is a no-op). Mask the replicated low bits back
+            // off the color channels so PNG output stays byte-identical to
+            // the parity oracle; alpha keeps full range (heif-dec emits no
+            // alpha channel for opaque images, and downstream 16-to-8
+            // conversion expects opaque == 65535).
+            let shift = 16_u32.saturating_sub(u32::from(decoded.source_bit_depth));
+            if shift > 0 {
+                let mask = u16::MAX << shift;
+                let masked: Vec<u16> = pixels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| if i % 4 == 3 { v } else { v & mask })
+                    .collect();
+                write_rgba16_png(
+                    decoded.width,
+                    decoded.height,
+                    &masked,
+                    decoded.icc_profile.as_deref(),
+                    output_path,
+                )
+            } else {
+                write_rgba16_png(
+                    decoded.width,
+                    decoded.height,
+                    pixels,
+                    decoded.icc_profile.as_deref(),
+                    output_path,
+                )
+            }
+        }
     }
 }
 
@@ -8714,14 +8744,15 @@ fn scale_sample_to_u16(sample: u16, bit_depth: u8) -> u16 {
         return sample;
     }
 
-    // Left shift into the top bits, byte-identical to libheif's PNG writer
-    // expansion (its `| (v >> (16 - shift))` replication term is always zero
-    // for in-range samples, so this is a plain shift there too). Peak white at
-    // bit depth b maps to ((1<<b)-1) << (16-b), not 65535. Do not "fix" this
-    // to true bit replication: heif-dec, the pixel-parity oracle for the test
-    // harness, emits exactly these shifted values.
+    // True bit replication: peak sample maps to u16::MAX (65535), matching
+    // the usual full-range convention for RGBA16 consumers and keeping opaque
+    // alpha equal to u16::MAX. heif-dec's PNG writer emits a plain left shift
+    // instead (its replication term is a no-op), but the difference lives in
+    // the low bits only and vanishes in the harness's 8-bit pixel comparison.
     let shift = 16 - u32::from(bit_depth);
-    (u32::from(sample) << shift).min(u32::from(u16::MAX)) as u16
+    let v = u32::from(sample);
+    ((v << shift) | (v >> (u32::from(bit_depth).saturating_sub(shift))))
+        .min(u32::from(u16::MAX)) as u16
 }
 
 #[derive(Default)]
