@@ -32,6 +32,8 @@ Commands:
   bench-image      Benchmark image adapter vs direct decode
   bench-stream     Benchmark path/read decode under concurrency
   all              Run full verify plus the standard benchmark set
+  gen-stress       Generate the HEVC stress corpus (rare syntax paths) into
+                   .heic-test-assets/stress-corpus (--force to regenerate)
   build-helper     Generate and build the local helper binaries only
 
 Common environment:
@@ -673,6 +675,11 @@ default_corpus_dirs() {
     "$LIBHEIF_SOURCE_DIR/fuzzing/data/corpus"
   if ensure_ente_fixtures; then
     ente_fixtures_files_dir
+  fi
+  # Locally generated HEVC stress corpus (scripts/gen_stress_corpus.sh or
+  # `scripts/heic_tests.sh gen-stress`); included when present.
+  if [[ -d "$ASSET_ROOT/stress-corpus" ]]; then
+    printf '%s\n' "$ASSET_ROOT/stress-corpus"
   fi
 }
 
@@ -1356,6 +1363,7 @@ main() {
     bench-image) cmd_pair_bench bench-image heif-image-adapter-bench direct adapter MAX_IMAGE_ADAPTER_SLOWDOWN MAX_IMAGE_ADAPTER_RSS_MULTIPLIER "$@" ;;
     bench-stream) cmd_bench_stream "$@" ;;
     all) cmd_all "$@" ;;
+    gen-stress) "$ROOT_DIR/scripts/gen_stress_corpus.sh" "$@" ;;
     build-helper) build_helper ;;
     *) fail "Unknown command: $command" ;;
   esac

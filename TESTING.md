@@ -9,16 +9,22 @@ The harness mirrors the correctness and performance checks used in `libheic-rs`.
 It uses libheif only as an external validator and optional corpus source. The
 crate does not use libheif source code or link to libheif.
 
-The default corpus has two parts:
+The default corpus has three parts:
 
-1. the libheif checkout's sample/test/fuzz images, and
+1. the libheif checkout's sample/test/fuzz images,
 2. the HEIC fixture corpus from
    <https://github.com/ente/test-fixtures> (`media/heic/v1/files`) — real
-   camera files that have caught regressions the libheif corpus misses.
+   camera files that have caught regressions the libheif corpus misses, and
+3. the locally generated HEVC stress corpus (once generated, see below) —
+   synthetic encodes exercising rare syntax paths that neither of the other
+   corpora reaches: 10/12-bit, 4:2:2, 4:4:4, lossless, transform skip,
+   custom scaling lists, extreme QPs, small CTUs, 1-CTB-wide WPP, NxN intra
+   partitions, and odd/tiny picture sizes. Several of these paths carried
+   silent-corruption bugs before this corpus existed.
 
 Changes to the HEIC decoder should be regression-tested with a default-corpus
-`verify` run, which covers both. Neither corpus is ever checked into this
-repository.
+`verify` run, which covers all three. None of the corpora are ever checked
+into this repository.
 
 - pixel-for-pixel PNG comparison against an external `heif-dec` validator
 - Rust decoder vs external validator decode timing
@@ -65,6 +71,20 @@ To pick up fixture files added upstream later, refresh the clone:
 ```bash
 git -C .heic-test-assets/ente-test-fixtures pull
 ```
+
+The stress corpus is generated once (a few minutes of x265 encoding) after
+the validator and fixtures are set up:
+
+```bash
+scripts/heic_tests.sh gen-stress
+```
+
+It lands in the gitignored `.heic-test-assets/stress-corpus/` and is picked
+up by default `verify` runs from then on. Regenerate with
+`scripts/heic_tests.sh gen-stress --force` (exact bytes may differ across
+x265 versions — that is fine, `verify` compares decoded pixels against
+`heif-dec` at run time, so any conformant encode of these feature
+combinations is a valid test).
 
 Then run:
 
