@@ -4840,6 +4840,14 @@ fn crop_heic_by_clean_aperture(
         detail: format!("grid tile clean-aperture top bound is out of range: {top}"),
     })?;
 
+    if crop_left == 0
+        && crop_top == 0
+        && crop_width == decoded.width
+        && crop_height == decoded.height
+    {
+        return Ok(decoded);
+    }
+
     validate_heic_plane_dimensions(
         &decoded.y_plane,
         decoded.width,
@@ -6423,7 +6431,7 @@ fn decode_primary_heic_to_rgba_from_resolved_input(
                 decoded.width,
                 decoded.height,
             );
-            decoded_heic_to_rgba_image(&decoded, transforms, auxiliary_alpha.as_ref(), icc_profile)
+            decoded_heic_to_rgba_image(decoded, transforms, auxiliary_alpha.as_ref(), icc_profile)
         }
     }
 }
@@ -7492,19 +7500,33 @@ fn decoded_avif_to_rgba_image(
 }
 
 fn decoded_heic_to_rgba_image(
-    decoded: &DecodedHeicImage,
+    mut decoded: DecodedHeicImage,
     transforms: &[isobmff::PrimaryItemTransformProperty],
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     icc_profile: Option<Vec<u8>>,
 ) -> Result<DecodedRgbaImage, DecodeError> {
-    let source_bit_depth = heic_bit_depth_for_png_conversion(decoded)?;
+    let mut remaining_transforms = transforms;
+    if auxiliary_alpha.is_none() {
+        while let Some(isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture)) =
+            remaining_transforms.first()
+        {
+            decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
+            remaining_transforms = &remaining_transforms[1..];
+        }
+    }
+
+    let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
     if source_bit_depth <= 8 {
-        let mut pixels = convert_heic_to_rgba8(decoded)?;
+        let mut pixels = convert_heic_to_rgba8(&decoded)?;
         if let Some(alpha) = auxiliary_alpha {
             apply_auxiliary_alpha_to_rgba8(&mut pixels, decoded.width, decoded.height, alpha)?;
         }
-        let (width, height, transformed) =
-            apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
+        let (width, height, transformed) = apply_primary_item_transforms_rgba(
+            decoded.width,
+            decoded.height,
+            pixels,
+            remaining_transforms,
+        )?;
         return Ok(DecodedRgbaImage {
             width,
             height,
@@ -7514,12 +7536,16 @@ fn decoded_heic_to_rgba_image(
         });
     }
 
-    let mut pixels = convert_heic_to_rgba16(decoded)?;
+    let mut pixels = convert_heic_to_rgba16(&decoded)?;
     if let Some(alpha) = auxiliary_alpha {
         apply_auxiliary_alpha_to_rgba16(&mut pixels, decoded.width, decoded.height, alpha)?;
     }
-    let (width, height, transformed) =
-        apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
+    let (width, height, transformed) = apply_primary_item_transforms_rgba(
+        decoded.width,
+        decoded.height,
+        pixels,
+        remaining_transforms,
+    )?;
     Ok(DecodedRgbaImage {
         width,
         height,
