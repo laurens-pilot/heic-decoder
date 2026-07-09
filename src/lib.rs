@@ -4354,7 +4354,7 @@ fn paste_heic_grid_tiles_to_rgba8(
         reference_ycbcr_matrix,
         conversion_ycbcr_range,
         conversion_ycbcr_matrix,
-        convert_heic_to_rgba8,
+        convert_heic_to_rgba8_into,
     )
 }
 
@@ -4386,7 +4386,7 @@ fn paste_heic_grid_tiles_to_rgba16(
         reference_ycbcr_matrix,
         conversion_ycbcr_range,
         conversion_ycbcr_matrix,
-        convert_heic_to_rgba16,
+        convert_heic_to_rgba16_into,
     )
 }
 
@@ -4404,11 +4404,12 @@ fn paste_heic_grid_tiles_to_rgba<T: Copy>(
     reference_ycbcr_matrix: YCbCrMatrixCoefficients,
     conversion_ycbcr_range: YCbCrRange,
     conversion_ycbcr_matrix: YCbCrMatrixCoefficients,
-    convert_tile: fn(&DecodedHeicImage) -> Result<Vec<T>, DecodeHeicError>,
+    convert_tile: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
 ) -> Result<(), DecodeError> {
     let descriptor = &grid_data.descriptor;
     let columns = usize::from(descriptor.columns);
     let mut first_tile = Some(first_tile);
+    let mut tile_pixels = Vec::new();
     for tile_index in 0..grid_data.tiles.len() {
         let mut tile = if tile_index == 0 {
             first_tile
@@ -4432,7 +4433,7 @@ fn paste_heic_grid_tiles_to_rgba<T: Copy>(
         )?;
         tile.ycbcr_range = conversion_ycbcr_range;
         tile.ycbcr_matrix = conversion_ycbcr_matrix;
-        let tile_pixels = convert_tile(&tile)?;
+        convert_tile(&tile, &mut tile_pixels)?;
         let row = tile_index / columns;
         let column = tile_index % columns;
         let (x_origin, y_origin) = heic_grid_tile_origin(tile_width, tile_height, row, column)?;
@@ -8619,6 +8620,15 @@ fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, Decode
 }
 
 fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHeicError> {
+    let mut out = Vec::new();
+    convert_heic_to_rgba8_into(decoded, &mut out)?;
+    Ok(out)
+}
+
+fn convert_heic_to_rgba8_into(
+    decoded: &DecodedHeicImage,
+    out: &mut Vec<u8>,
+) -> Result<(), DecodeHeicError> {
     let ycbcr_transform =
         ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
             DecodeHeicError::UnsupportedMatrixCoefficients {
@@ -8656,7 +8666,7 @@ fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHe
                     decoded.width, decoded.height
                 ),
             })?;
-    let mut out = vec![0_u8; output_len];
+    out.resize(output_len, 0);
 
     let chroma = prepare_heic_chroma(decoded)?;
     let chroma_midpoint = chroma_midpoint(bit_depth);
@@ -8711,10 +8721,19 @@ fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHe
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
 fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, DecodeHeicError> {
+    let mut out = Vec::new();
+    convert_heic_to_rgba16_into(decoded, &mut out)?;
+    Ok(out)
+}
+
+fn convert_heic_to_rgba16_into(
+    decoded: &DecodedHeicImage,
+    out: &mut Vec<u16>,
+) -> Result<(), DecodeHeicError> {
     let ycbcr_transform =
         ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
             DecodeHeicError::UnsupportedMatrixCoefficients {
@@ -8752,7 +8771,7 @@ fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, Decode
                     decoded.width, decoded.height
                 ),
             })?;
-    let mut out = vec![0_u16; output_len];
+    out.resize(output_len, 0);
 
     let chroma = prepare_heic_chroma(decoded)?;
     let chroma_midpoint = chroma_midpoint(bit_depth);
@@ -8796,7 +8815,7 @@ fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, Decode
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
 enum AvifAuxiliaryAlphaSamples<'a> {
