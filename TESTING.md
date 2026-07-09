@@ -27,6 +27,10 @@ Changes to the HEIC decoder should be regression-tested with a default-corpus
 into this repository.
 
 - pixel-for-pixel PNG comparison against an external `heif-dec` validator
+- embedded ICC colour-profile comparison against the validator's PNG output:
+  when `heif-dec` embeds a profile, the Rust PNG must carry byte-identical
+  profile data; a Rust-only profile is allowed (the Rust decoder synthesizes
+  ICC from nclx colour information, which `heif-dec` does not embed)
 - Rust decoder vs external validator decode timing
 - bytes vs path ingestion timing
 - `image` adapter vs direct decode timing
