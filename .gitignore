@@ -12,6 +12,3 @@
 /coverage/
 /tarpaulin-report.html
 *.profraw
-
-# Library crates normally do not commit Cargo.lock.
-/Cargo.lock

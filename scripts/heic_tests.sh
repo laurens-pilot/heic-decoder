@@ -154,6 +154,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 png = "0.18"
 EOF
 
+  # Seed the helper workspace with the root lockfile so helper builds resolve
+  # the same dependency versions (notably the rav1d git branch) as the crate.
+  if [[ -f "$ROOT_DIR/Cargo.lock" ]]; then
+    cp "$ROOT_DIR/Cargo.lock" "$HELPER_DIR/Cargo.lock"
+  fi
+
   cat > "$HELPER_DIR/src/bin/heif-png-icc.rs" <<'RS'
 use std::borrow::Cow;
 use std::fs::File;
