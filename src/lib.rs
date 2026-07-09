@@ -1400,17 +1400,7 @@ fn decode_primary_heic_to_image_internal(
             Ok(decoded)
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
-            let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
-                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, &item_data)?;
-            let mut decoded = decode_hevc_stream_to_image(&stream)?;
-            if let Some(ycbcr_range) = ycbcr_range_override {
-                decoded.ycbcr_range = ycbcr_range;
-            }
-            if let Some(ycbcr_matrix) = ycbcr_matrix_override {
-                decoded.ycbcr_matrix = ycbcr_matrix;
-            }
-            validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
-            Ok(decoded)
+            decode_primary_heic_coded_item_to_image(input, &item_data)
         }
     }
 }
@@ -3942,6 +3932,65 @@ fn decode_primary_heic_stream_and_metadata_from_coded_item_data(
     Ok((stream, decoded, ycbcr_range_override, ycbcr_matrix_override))
 }
 
+/// Decode the primary coded (non-grid) HEIC item: assemble and decode its
+/// HEVC stream, apply the container's nclx range/matrix overrides, and
+/// validate the decoded frame against the container metadata.
+fn decode_primary_heic_coded_item_to_image(
+    input: &[u8],
+    item_data: &isobmff::HeicPrimaryItemData,
+) -> Result<DecodedHeicImage, DecodeHeicError> {
+    let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
+        decode_primary_heic_stream_and_metadata_from_coded_item_data(input, item_data)?;
+    let mut decoded = decode_hevc_stream_to_image(&stream)?;
+    if let Some(ycbcr_range) = ycbcr_range_override {
+        decoded.ycbcr_range = ycbcr_range;
+    }
+    if let Some(ycbcr_matrix) = ycbcr_matrix_override {
+        decoded.ycbcr_matrix = ycbcr_matrix;
+    }
+    validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
+    Ok(decoded)
+}
+
+/// Decode the primary coded HEIC item, enforce the pixel-count guardrail,
+/// and resolve its auxiliary alpha plane.
+fn decode_primary_heic_coded_item_with_alpha(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    item_data: &isobmff::HeicPrimaryItemData,
+    guardrails: &DecodeGuardrails,
+) -> Result<(DecodedHeicImage, Option<HeicAuxiliaryAlphaPlane>), DecodeError> {
+    let decoded = decode_primary_heic_coded_item_to_image(input, item_data)?;
+    guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
+    let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+        input,
+        source,
+        decoded.width,
+        decoded.height,
+    );
+    Ok((decoded, auxiliary_alpha))
+}
+
+/// Enforce the pixel-count guardrail on the grid descriptor and resolve the
+/// grid's auxiliary alpha plane before any tile is decoded.
+fn decode_primary_heic_grid_auxiliary_alpha(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    grid_data: &isobmff::HeicGridPrimaryItemData,
+    guardrails: &DecodeGuardrails,
+) -> Result<Option<HeicAuxiliaryAlphaPlane>, DecodeError> {
+    guardrails.enforce_pixel_count(
+        grid_data.descriptor.output_width,
+        grid_data.descriptor.output_height,
+    )?;
+    Ok(decode_primary_heic_auxiliary_alpha_plane_internal(
+        input,
+        source,
+        grid_data.descriptor.output_width,
+        grid_data.descriptor.output_height,
+    ))
+}
+
 fn decoded_heic_image_to_metadata(decoded: &DecodedHeicImage) -> DecodedHeicImageMetadata {
     DecodedHeicImageMetadata {
         width: decoded.width,
@@ -4172,18 +4221,7 @@ fn decode_primary_heic_grid_to_rgba_image(
             })?;
     let first_tile = decode_heic_grid_tile_to_image(first_tile_data)?;
     validate_decoded_heic_grid_first_tile(descriptor, &first_tile)?;
-
-    let tile_width = first_tile.width;
-    let tile_height = first_tile.height;
-    let reference_layout = first_tile.layout;
-    let reference_bit_depth_luma = first_tile.bit_depth_luma;
-    let reference_bit_depth_chroma = first_tile.bit_depth_chroma;
-    let reference_ycbcr_range = first_tile.ycbcr_range;
-    let reference_ycbcr_matrix = first_tile.ycbcr_matrix;
-    let conversion_ycbcr_range =
-        ycbcr_range_override_from_primary_colr(&grid_data.colr).unwrap_or(reference_ycbcr_range);
-    let conversion_ycbcr_matrix =
-        ycbcr_matrix_override_from_primary_colr(&grid_data.colr).unwrap_or(reference_ycbcr_matrix);
+    let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
     let source_bit_depth = heic_bit_depth_for_png_conversion(&first_tile)?;
     // Direct orientation is safe for opaque grids. Alpha and clean aperture
     // stay on the existing source-coordinate transform path.
@@ -4209,20 +4247,13 @@ fn decode_primary_heic_grid_to_rgba_image(
 
     if source_bit_depth <= 8 {
         let mut output = vec![0_u8; checked_rgba_sample_count(output_width, output_height)?];
-        paste_heic_grid_tiles_to_rgba8(
+        paste_heic_grid_tiles_to_rgba(
             grid_data,
             first_tile,
             &mut output,
-            tile_width,
-            tile_height,
-            reference_layout,
-            reference_bit_depth_luma,
-            reference_bit_depth_chroma,
-            reference_ycbcr_range,
-            reference_ycbcr_matrix,
-            conversion_ycbcr_range,
-            conversion_ycbcr_matrix,
+            &reference,
             direct_orientation_transform.as_ref(),
+            convert_heic_to_rgba8_into,
         )?;
         if direct_orientation_transform.is_some() {
             return Ok(DecodedRgbaImage {
@@ -4257,20 +4288,13 @@ fn decode_primary_heic_grid_to_rgba_image(
     }
 
     let mut output = vec![0_u16; checked_rgba_sample_count(output_width, output_height)?];
-    paste_heic_grid_tiles_to_rgba16(
+    paste_heic_grid_tiles_to_rgba(
         grid_data,
         first_tile,
         &mut output,
-        tile_width,
-        tile_height,
-        reference_layout,
-        reference_bit_depth_luma,
-        reference_bit_depth_chroma,
-        reference_ycbcr_range,
-        reference_ycbcr_matrix,
-        conversion_ycbcr_range,
-        conversion_ycbcr_matrix,
+        &reference,
         direct_orientation_transform.as_ref(),
+        convert_heic_to_rgba16_into,
     )?;
     if direct_orientation_transform.is_some() {
         return Ok(DecodedRgbaImage {
@@ -4327,43 +4351,73 @@ fn validate_decoded_heic_grid_first_tile(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn validate_decoded_heic_grid_tile_reference(
-    tile: &DecodedHeicImage,
+/// Per-grid reference metadata every tile must match, plus the YCbCr
+/// interpretation used for RGBA conversion (the grid-level colr override,
+/// falling back to the first tile's bitstream metadata).
+#[derive(Clone, Copy, Debug)]
+struct HeicGridTileReference {
     tile_width: u32,
     tile_height: u32,
-    reference_layout: HeicPixelLayout,
-    reference_bit_depth_luma: u8,
-    reference_bit_depth_chroma: u8,
-    reference_ycbcr_range: YCbCrRange,
-    reference_ycbcr_matrix: YCbCrMatrixCoefficients,
+    layout: HeicPixelLayout,
+    bit_depth_luma: u8,
+    bit_depth_chroma: u8,
+    ycbcr_range: YCbCrRange,
+    ycbcr_matrix: YCbCrMatrixCoefficients,
+    conversion_ycbcr_range: YCbCrRange,
+    conversion_ycbcr_matrix: YCbCrMatrixCoefficients,
+}
+
+impl HeicGridTileReference {
+    fn from_first_tile(
+        first_tile: &DecodedHeicImage,
+        grid_colr: &isobmff::PrimaryItemColorProperties,
+    ) -> Self {
+        Self {
+            tile_width: first_tile.width,
+            tile_height: first_tile.height,
+            layout: first_tile.layout,
+            bit_depth_luma: first_tile.bit_depth_luma,
+            bit_depth_chroma: first_tile.bit_depth_chroma,
+            ycbcr_range: first_tile.ycbcr_range,
+            ycbcr_matrix: first_tile.ycbcr_matrix,
+            conversion_ycbcr_range: ycbcr_range_override_from_primary_colr(grid_colr)
+                .unwrap_or(first_tile.ycbcr_range),
+            conversion_ycbcr_matrix: ycbcr_matrix_override_from_primary_colr(grid_colr)
+                .unwrap_or(first_tile.ycbcr_matrix),
+        }
+    }
+}
+
+fn validate_decoded_heic_grid_tile_reference(
+    tile: &DecodedHeicImage,
+    reference: &HeicGridTileReference,
     tile_index: usize,
 ) -> Result<(), DecodeHeicError> {
-    if tile.width != tile_width || tile.height != tile_height {
+    if tile.width != reference.tile_width || tile.height != reference.tile_height {
         return Err(DecodeHeicError::InvalidDecodedFrame {
             detail: format!(
-                "grid tiles have mixed dimensions: expected {tile_width}x{tile_height}, got {}x{} at index {tile_index}",
-                tile.width, tile.height
+                "grid tiles have mixed dimensions: expected {}x{}, got {}x{} at index {tile_index}",
+                reference.tile_width, reference.tile_height, tile.width, tile.height
             ),
         });
     }
-    if tile.layout != reference_layout {
+    if tile.layout != reference.layout {
         return Err(DecodeHeicError::DecodedLayoutMismatch {
-            expected: reference_layout,
+            expected: reference.layout,
             actual: tile.layout,
         });
     }
-    if tile.bit_depth_luma != reference_bit_depth_luma
-        || tile.bit_depth_chroma != reference_bit_depth_chroma
+    if tile.bit_depth_luma != reference.bit_depth_luma
+        || tile.bit_depth_chroma != reference.bit_depth_chroma
     {
         return Err(DecodeHeicError::DecodedBitDepthMismatch {
-            expected_luma: reference_bit_depth_luma,
-            expected_chroma: reference_bit_depth_chroma,
+            expected_luma: reference.bit_depth_luma,
+            expected_chroma: reference.bit_depth_chroma,
             actual_luma: tile.bit_depth_luma,
             actual_chroma: tile.bit_depth_chroma,
         });
     }
-    if tile.ycbcr_range != reference_ycbcr_range || tile.ycbcr_matrix != reference_ycbcr_matrix {
+    if tile.ycbcr_range != reference.ycbcr_range || tile.ycbcr_matrix != reference.ycbcr_matrix {
         return Err(DecodeHeicError::InvalidDecodedFrame {
             detail: format!("grid tiles have inconsistent YCbCr metadata at index {tile_index}"),
         });
@@ -4372,88 +4426,11 @@ fn validate_decoded_heic_grid_tile_reference(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paste_heic_grid_tiles_to_rgba8(
-    grid_data: &isobmff::HeicGridPrimaryItemData,
-    first_tile: DecodedHeicImage,
-    output: &mut [u8],
-    tile_width: u32,
-    tile_height: u32,
-    reference_layout: HeicPixelLayout,
-    reference_bit_depth_luma: u8,
-    reference_bit_depth_chroma: u8,
-    reference_ycbcr_range: YCbCrRange,
-    reference_ycbcr_matrix: YCbCrMatrixCoefficients,
-    conversion_ycbcr_range: YCbCrRange,
-    conversion_ycbcr_matrix: YCbCrMatrixCoefficients,
-    orientation_transform: Option<&RgbaOrientationTransform>,
-) -> Result<(), DecodeError> {
-    paste_heic_grid_tiles_to_rgba(
-        grid_data,
-        first_tile,
-        output,
-        tile_width,
-        tile_height,
-        reference_layout,
-        reference_bit_depth_luma,
-        reference_bit_depth_chroma,
-        reference_ycbcr_range,
-        reference_ycbcr_matrix,
-        conversion_ycbcr_range,
-        conversion_ycbcr_matrix,
-        orientation_transform,
-        convert_heic_to_rgba8_into,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paste_heic_grid_tiles_to_rgba16(
-    grid_data: &isobmff::HeicGridPrimaryItemData,
-    first_tile: DecodedHeicImage,
-    output: &mut [u16],
-    tile_width: u32,
-    tile_height: u32,
-    reference_layout: HeicPixelLayout,
-    reference_bit_depth_luma: u8,
-    reference_bit_depth_chroma: u8,
-    reference_ycbcr_range: YCbCrRange,
-    reference_ycbcr_matrix: YCbCrMatrixCoefficients,
-    conversion_ycbcr_range: YCbCrRange,
-    conversion_ycbcr_matrix: YCbCrMatrixCoefficients,
-    orientation_transform: Option<&RgbaOrientationTransform>,
-) -> Result<(), DecodeError> {
-    paste_heic_grid_tiles_to_rgba(
-        grid_data,
-        first_tile,
-        output,
-        tile_width,
-        tile_height,
-        reference_layout,
-        reference_bit_depth_luma,
-        reference_bit_depth_chroma,
-        reference_ycbcr_range,
-        reference_ycbcr_matrix,
-        conversion_ycbcr_range,
-        conversion_ycbcr_matrix,
-        orientation_transform,
-        convert_heic_to_rgba16_into,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn paste_heic_grid_tiles_to_rgba<T: Copy>(
     grid_data: &isobmff::HeicGridPrimaryItemData,
     first_tile: DecodedHeicImage,
     output: &mut [T],
-    tile_width: u32,
-    tile_height: u32,
-    reference_layout: HeicPixelLayout,
-    reference_bit_depth_luma: u8,
-    reference_bit_depth_chroma: u8,
-    reference_ycbcr_range: YCbCrRange,
-    reference_ycbcr_matrix: YCbCrMatrixCoefficients,
-    conversion_ycbcr_range: YCbCrRange,
-    conversion_ycbcr_matrix: YCbCrMatrixCoefficients,
+    reference: &HeicGridTileReference,
     orientation_transform: Option<&RgbaOrientationTransform>,
     convert_tile: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
 ) -> Result<(), DecodeError> {
@@ -4471,23 +4448,15 @@ fn paste_heic_grid_tiles_to_rgba<T: Copy>(
         } else {
             decode_heic_grid_tile_to_image(&grid_data.tiles[tile_index])?
         };
-        validate_decoded_heic_grid_tile_reference(
-            &tile,
-            tile_width,
-            tile_height,
-            reference_layout,
-            reference_bit_depth_luma,
-            reference_bit_depth_chroma,
-            reference_ycbcr_range,
-            reference_ycbcr_matrix,
-            tile_index,
-        )?;
-        tile.ycbcr_range = conversion_ycbcr_range;
-        tile.ycbcr_matrix = conversion_ycbcr_matrix;
+        validate_decoded_heic_grid_tile_reference(&tile, reference, tile_index)?;
+        tile.ycbcr_range = reference.conversion_ycbcr_range;
+        tile.ycbcr_matrix = reference.conversion_ycbcr_matrix;
         convert_tile(&tile, &mut tile_pixels)?;
         let row = tile_index / columns;
         let column = tile_index % columns;
-        let (x_origin, y_origin) = heic_grid_tile_origin(tile_width, tile_height, row, column)?;
+        let (x_origin, y_origin) =
+            heic_grid_tile_origin(reference.tile_width, reference.tile_height, row, column)?;
+        validate_heic_grid_tile_origin_alignment(reference.layout, x_origin, y_origin)?;
         if let Some(orientation_transform) = orientation_transform {
             paste_transformed_rgba_tile_with_clip(
                 &tile_pixels,
@@ -4553,6 +4522,27 @@ fn heic_grid_tile_origin(
     })?;
 
     Ok((x_origin, y_origin))
+}
+
+/// Reject grid tile origins that are not aligned to the layout's chroma
+/// subsampling. Pasting such tiles would sample chroma with a different
+/// phase than libheif at tile seams, so fail loudly instead — matching the
+/// plane-canvas grid path.
+fn validate_heic_grid_tile_origin_alignment(
+    layout: HeicPixelLayout,
+    x_origin: u32,
+    y_origin: u32,
+) -> Result<(), DecodeHeicError> {
+    let (subsample_x, subsample_y) = heic_chroma_subsampling(layout);
+    if !x_origin.is_multiple_of(subsample_x) || !y_origin.is_multiple_of(subsample_y) {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "grid tile origin ({x_origin},{y_origin}) is not aligned for {layout:?} chroma subsampling"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -5186,14 +5176,7 @@ fn paste_decoded_heic_grid_tile(
     }
 
     let (subsample_x, subsample_y) = heic_chroma_subsampling(output.layout);
-    if !x_origin.is_multiple_of(subsample_x) || !y_origin.is_multiple_of(subsample_y) {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "grid tile origin ({x_origin},{y_origin}) is not aligned for {:?} chroma subsampling",
-                output.layout
-            ),
-        });
-    }
+    validate_heic_grid_tile_origin_alignment(output.layout, x_origin, y_origin)?;
 
     let (tile_u_plane, tile_v_plane, expected_chroma_width, expected_chroma_height) =
         require_heic_chroma_planes(tile)?;
@@ -6937,16 +6920,8 @@ fn decode_primary_heic_to_rgba_from_resolved_input(
 
     match primary_with_grid {
         isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
-            guardrails.enforce_pixel_count(
-                grid_data.descriptor.output_width,
-                grid_data.descriptor.output_height,
-            )?;
-            let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
-                input,
-                source,
-                grid_data.descriptor.output_width,
-                grid_data.descriptor.output_height,
-            );
+            let auxiliary_alpha =
+                decode_primary_heic_grid_auxiliary_alpha(input, source, &grid_data, &guardrails)?;
             decode_primary_heic_grid_to_rgba_image(
                 &grid_data,
                 transforms,
@@ -6955,23 +6930,8 @@ fn decode_primary_heic_to_rgba_from_resolved_input(
             )
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
-            let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
-                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, &item_data)?;
-            let mut decoded = decode_hevc_stream_to_image(&stream)?;
-            if let Some(ycbcr_range) = ycbcr_range_override {
-                decoded.ycbcr_range = ycbcr_range;
-            }
-            if let Some(ycbcr_matrix) = ycbcr_matrix_override {
-                decoded.ycbcr_matrix = ycbcr_matrix;
-            }
-            validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
-            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
-            let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
-                input,
-                source,
-                decoded.width,
-                decoded.height,
-            );
+            let (decoded, auxiliary_alpha) =
+                decode_primary_heic_coded_item_with_alpha(input, source, &item_data, &guardrails)?;
             decoded_heic_to_rgba_image(decoded, transforms, auxiliary_alpha.as_ref(), icc_profile)
         }
     }
@@ -7165,86 +7125,16 @@ fn decode_primary_heic_grid_to_rgba8_slice(
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
-    if auxiliary_alpha.is_none() && grid_transforms_can_write_directly(transforms) {
-        let first_tile_data =
-            grid_data
-                .tiles
-                .first()
-                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                    detail: "grid tile list cannot be empty".to_string(),
-                })?;
-        let first_tile = decode_heic_grid_tile_to_image(first_tile_data)?;
-        validate_decoded_heic_grid_first_tile(&grid_data.descriptor, &first_tile)?;
-        let source_bit_depth = heic_bit_depth_for_png_conversion(&first_tile)?;
-        if source_bit_depth > 8 {
-            return Err(DecodeError::Unsupported(
-                "HEIC grid storage is RGBA16, not RGBA8".to_string(),
-            ));
-        }
-
-        let direct_orientation_transform = rgba_orientation_transform_from_primary_transforms(
-            grid_data.descriptor.output_width,
-            grid_data.descriptor.output_height,
-            transforms,
-        )?;
-        let output_width = direct_orientation_transform
-            .as_ref()
-            .map_or(grid_data.descriptor.output_width, |transform| {
-                transform.destination_width
-            });
-        let output_height = direct_orientation_transform
-            .as_ref()
-            .map_or(grid_data.descriptor.output_height, |transform| {
-                transform.destination_height
-            });
-        let expected = checked_rgba_sample_count(output_width, output_height)?;
-        if out.len() != expected {
-            return Err(DecodeError::TransformGuard(
-                TransformGuardError::RgbaSampleCountMismatch {
-                    stage: "HEIC grid RGBA8 image adapter output",
-                    actual: out.len(),
-                    expected,
-                    width: output_width,
-                    height: output_height,
-                },
-            ));
-        }
-
-        // Caller-provided ImageDecoder buffers are not guaranteed to be
-        // pre-cleared. Preserve the owned grid path's zero-filled gaps when
-        // clipped tiles do not cover the descriptor output exactly.
-        out.fill(0);
-        let tile_width = first_tile.width;
-        let tile_height = first_tile.height;
-        let reference_layout = first_tile.layout;
-        let reference_bit_depth_luma = first_tile.bit_depth_luma;
-        let reference_bit_depth_chroma = first_tile.bit_depth_chroma;
-        let reference_ycbcr_range = first_tile.ycbcr_range;
-        let reference_ycbcr_matrix = first_tile.ycbcr_matrix;
-        let conversion_ycbcr_range = ycbcr_range_override_from_primary_colr(&grid_data.colr)
-            .unwrap_or(reference_ycbcr_range);
-        let conversion_ycbcr_matrix = ycbcr_matrix_override_from_primary_colr(&grid_data.colr)
-            .unwrap_or(reference_ycbcr_matrix);
-        return paste_heic_grid_tiles_to_rgba8(
-            grid_data,
-            first_tile,
-            out,
-            tile_width,
-            tile_height,
-            reference_layout,
-            reference_bit_depth_luma,
-            reference_bit_depth_chroma,
-            reference_ycbcr_range,
-            reference_ycbcr_matrix,
-            conversion_ycbcr_range,
-            conversion_ycbcr_matrix,
-            direct_orientation_transform.as_ref(),
-        );
-    }
-
-    let decoded =
-        decode_primary_heic_grid_to_rgba_image(grid_data, transforms, auxiliary_alpha, None)?;
-    copy_decoded_rgba8_to_slice(decoded, out)
+    decode_primary_heic_grid_to_rgba_slice(
+        grid_data,
+        transforms,
+        auxiliary_alpha,
+        out,
+        8,
+        "HEIC grid RGBA8 image adapter output",
+        convert_heic_to_rgba8_into,
+        copy_decoded_rgba8_to_slice,
+    )
 }
 
 #[cfg(feature = "image-integration")]
@@ -7253,6 +7143,30 @@ fn decode_primary_heic_grid_to_rgba16_slice(
     transforms: &[isobmff::PrimaryItemTransformProperty],
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     out: &mut [u16],
+) -> Result<(), DecodeError> {
+    decode_primary_heic_grid_to_rgba_slice(
+        grid_data,
+        transforms,
+        auxiliary_alpha,
+        out,
+        16,
+        "HEIC grid RGBA16 image adapter output",
+        convert_heic_to_rgba16_into,
+        copy_decoded_rgba16_to_slice,
+    )
+}
+
+#[cfg(feature = "image-integration")]
+#[allow(clippy::too_many_arguments)]
+fn decode_primary_heic_grid_to_rgba_slice<T: Copy + Default>(
+    grid_data: &isobmff::HeicGridPrimaryItemData,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
+    out: &mut [T],
+    storage_bit_depth: u8,
+    sample_count_stage: &'static str,
+    convert_tile: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
+    copy_decoded_to_slice: fn(DecodedRgbaImage, &mut [T]) -> Result<(), DecodeError>,
 ) -> Result<(), DecodeError> {
     if auxiliary_alpha.is_none() && grid_transforms_can_write_directly(transforms) {
         let first_tile_data =
@@ -7265,10 +7179,11 @@ fn decode_primary_heic_grid_to_rgba16_slice(
         let first_tile = decode_heic_grid_tile_to_image(first_tile_data)?;
         validate_decoded_heic_grid_first_tile(&grid_data.descriptor, &first_tile)?;
         let source_bit_depth = heic_bit_depth_for_png_conversion(&first_tile)?;
-        if source_bit_depth <= 8 {
-            return Err(DecodeError::Unsupported(
-                "HEIC grid storage is RGBA8, not RGBA16".to_string(),
-            ));
+        let source_storage_bit_depth: u8 = if source_bit_depth <= 8 { 8 } else { 16 };
+        if source_storage_bit_depth != storage_bit_depth {
+            return Err(DecodeError::Unsupported(format!(
+                "HEIC grid storage is RGBA{source_storage_bit_depth}, not RGBA{storage_bit_depth}"
+            )));
         }
 
         let direct_orientation_transform = rgba_orientation_transform_from_primary_transforms(
@@ -7290,7 +7205,7 @@ fn decode_primary_heic_grid_to_rgba16_slice(
         if out.len() != expected {
             return Err(DecodeError::TransformGuard(
                 TransformGuardError::RgbaSampleCountMismatch {
-                    stage: "HEIC grid RGBA16 image adapter output",
+                    stage: sample_count_stage,
                     actual: out.len(),
                     expected,
                     width: output_width,
@@ -7302,38 +7217,21 @@ fn decode_primary_heic_grid_to_rgba16_slice(
         // Caller-provided ImageDecoder buffers are not guaranteed to be
         // pre-cleared. Preserve the owned grid path's zero-filled gaps when
         // clipped tiles do not cover the descriptor output exactly.
-        out.fill(0);
-        let tile_width = first_tile.width;
-        let tile_height = first_tile.height;
-        let reference_layout = first_tile.layout;
-        let reference_bit_depth_luma = first_tile.bit_depth_luma;
-        let reference_bit_depth_chroma = first_tile.bit_depth_chroma;
-        let reference_ycbcr_range = first_tile.ycbcr_range;
-        let reference_ycbcr_matrix = first_tile.ycbcr_matrix;
-        let conversion_ycbcr_range = ycbcr_range_override_from_primary_colr(&grid_data.colr)
-            .unwrap_or(reference_ycbcr_range);
-        let conversion_ycbcr_matrix = ycbcr_matrix_override_from_primary_colr(&grid_data.colr)
-            .unwrap_or(reference_ycbcr_matrix);
-        return paste_heic_grid_tiles_to_rgba16(
+        out.fill(T::default());
+        let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
+        return paste_heic_grid_tiles_to_rgba(
             grid_data,
             first_tile,
             out,
-            tile_width,
-            tile_height,
-            reference_layout,
-            reference_bit_depth_luma,
-            reference_bit_depth_chroma,
-            reference_ycbcr_range,
-            reference_ycbcr_matrix,
-            conversion_ycbcr_range,
-            conversion_ycbcr_matrix,
+            &reference,
             direct_orientation_transform.as_ref(),
+            convert_tile,
         );
     }
 
     let decoded =
         decode_primary_heic_grid_to_rgba_image(grid_data, transforms, auxiliary_alpha, None)?;
-    copy_decoded_rgba16_to_slice(decoded, out)
+    copy_decoded_to_slice(decoded, out)
 }
 
 #[cfg(feature = "image-integration")]
@@ -7466,16 +7364,12 @@ fn decode_heif_bytes_to_rgba8_slice(
 
     match primary_with_grid {
         isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
-            guardrails.enforce_pixel_count(
-                grid_data.descriptor.output_width,
-                grid_data.descriptor.output_height,
-            )?;
-            let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+            let auxiliary_alpha = decode_primary_heic_grid_auxiliary_alpha(
                 input,
                 &mut source,
-                grid_data.descriptor.output_width,
-                grid_data.descriptor.output_height,
-            );
+                &grid_data,
+                &guardrails,
+            )?;
             decode_primary_heic_grid_to_rgba8_slice(
                 &grid_data,
                 &transforms,
@@ -7484,23 +7378,12 @@ fn decode_heif_bytes_to_rgba8_slice(
             )
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
-            let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
-                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, &item_data)?;
-            let mut decoded = decode_hevc_stream_to_image(&stream)?;
-            if let Some(ycbcr_range) = ycbcr_range_override {
-                decoded.ycbcr_range = ycbcr_range;
-            }
-            if let Some(ycbcr_matrix) = ycbcr_matrix_override {
-                decoded.ycbcr_matrix = ycbcr_matrix;
-            }
-            validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
-            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
-            let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+            let (decoded, auxiliary_alpha) = decode_primary_heic_coded_item_with_alpha(
                 input,
                 &mut source,
-                decoded.width,
-                decoded.height,
-            );
+                &item_data,
+                &guardrails,
+            )?;
             decoded_heic_to_rgba8_slice(decoded, &transforms, auxiliary_alpha.as_ref(), out)
         }
     }
@@ -7536,16 +7419,12 @@ fn decode_heif_bytes_to_rgba16_slice(
 
     match primary_with_grid {
         isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
-            guardrails.enforce_pixel_count(
-                grid_data.descriptor.output_width,
-                grid_data.descriptor.output_height,
-            )?;
-            let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+            let auxiliary_alpha = decode_primary_heic_grid_auxiliary_alpha(
                 input,
                 &mut source,
-                grid_data.descriptor.output_width,
-                grid_data.descriptor.output_height,
-            );
+                &grid_data,
+                &guardrails,
+            )?;
             decode_primary_heic_grid_to_rgba16_slice(
                 &grid_data,
                 &transforms,
@@ -7554,23 +7433,12 @@ fn decode_heif_bytes_to_rgba16_slice(
             )
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
-            let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
-                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, &item_data)?;
-            let mut decoded = decode_hevc_stream_to_image(&stream)?;
-            if let Some(ycbcr_range) = ycbcr_range_override {
-                decoded.ycbcr_range = ycbcr_range;
-            }
-            if let Some(ycbcr_matrix) = ycbcr_matrix_override {
-                decoded.ycbcr_matrix = ycbcr_matrix;
-            }
-            validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
-            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
-            let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+            let (decoded, auxiliary_alpha) = decode_primary_heic_coded_item_with_alpha(
                 input,
                 &mut source,
-                decoded.width,
-                decoded.height,
-            );
+                &item_data,
+                &guardrails,
+            )?;
             decoded_heic_to_rgba16_slice(decoded, &transforms, auxiliary_alpha.as_ref(), out)
         }
     }
@@ -11323,6 +11191,45 @@ mod tests {
         assert_eq!(width, orientation_transform.destination_width);
         assert_eq!(height, orientation_transform.destination_height);
         assert_eq!(direct, transformed);
+    }
+
+    #[test]
+    fn unaligned_grid_tile_origin_is_rejected() {
+        // Mirrors the plane-canvas paste path: tile origins that are not
+        // chroma-aligned must fail loudly instead of silently pasting tiles
+        // whose seams sample chroma with a shifted phase.
+        assert!(
+            super::validate_heic_grid_tile_origin_alignment(super::HeicPixelLayout::Yuv420, 99, 0)
+                .is_err()
+        );
+        assert!(
+            super::validate_heic_grid_tile_origin_alignment(super::HeicPixelLayout::Yuv420, 0, 99)
+                .is_err()
+        );
+        assert!(
+            super::validate_heic_grid_tile_origin_alignment(super::HeicPixelLayout::Yuv420, 98, 98)
+                .is_ok()
+        );
+
+        // 4:2:2 chroma is only horizontally subsampled.
+        assert!(
+            super::validate_heic_grid_tile_origin_alignment(super::HeicPixelLayout::Yuv422, 99, 0)
+                .is_err()
+        );
+        assert!(
+            super::validate_heic_grid_tile_origin_alignment(super::HeicPixelLayout::Yuv422, 0, 99)
+                .is_ok()
+        );
+
+        // 4:4:4 and monochrome have no subsampling to misalign.
+        assert!(
+            super::validate_heic_grid_tile_origin_alignment(super::HeicPixelLayout::Yuv444, 99, 99)
+                .is_ok()
+        );
+        assert!(
+            super::validate_heic_grid_tile_origin_alignment(super::HeicPixelLayout::Yuv400, 99, 99)
+                .is_ok()
+        );
     }
 
     // Clean-aperture chroma-phase tests: libheif refuses to crop subsampled
