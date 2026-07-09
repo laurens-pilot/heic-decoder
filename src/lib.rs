@@ -9204,6 +9204,118 @@ mod tests {
         assert!(parsed.copyright.is_some());
     }
 
+    // Rendering-contract tests: qcms (Firefox's colour engine) acts as an
+    // independent CMS, so these catch semantic regressions in synthesized
+    // profiles that moxcms round-trips cannot see (it validating its own
+    // output). The contracts encode measured viewer behaviour: still-image
+    // pipelines render the 709-OETF family as sRGB, so those profiles must be
+    // exact no-op transforms against sRGB.
+
+    fn synthesize_nclx_icc(
+        colour_primaries: u16,
+        transfer_characteristics: u16,
+        matrix_coefficients: u16,
+    ) -> Option<Vec<u8>> {
+        nclx_to_icc_profile(&isobmff::NclxColorProfile {
+            colour_primaries,
+            transfer_characteristics,
+            matrix_coefficients,
+            full_range_flag: true,
+        })
+    }
+
+    fn qcms_through_to_srgb(icc: &[u8], rgb: [u8; 3]) -> [u8; 3] {
+        let profile =
+            qcms::Profile::new_from_slice(icc, false).expect("qcms should parse synthesized ICC");
+        let srgb = qcms::Profile::new_sRGB();
+        let transform = qcms::Transform::new(
+            &profile,
+            &srgb,
+            qcms::DataType::RGB8,
+            qcms::Intent::Perceptual,
+        )
+        .expect("qcms should build a transform from the synthesized ICC");
+        let mut pixel = rgb.to_vec();
+        transform.apply(&mut pixel);
+        [pixel[0], pixel[1], pixel[2]]
+    }
+
+    #[test]
+    fn bt709_family_profiles_are_srgb_identity_in_qcms() {
+        for transfer in [1u16, 6, 14, 15] {
+            let icc = synthesize_nclx_icc(1, transfer, 1).expect("expected synthesized ICC");
+            for v in [0u8, 32, 64, 128, 192, 224, 255] {
+                let out = qcms_through_to_srgb(&icc, [v, v, v]);
+                for channel in out {
+                    assert!(
+                        channel.abs_diff(v) <= 1,
+                        "transfer {transfer}: gray {v} rendered as {out:?}; \
+                         709-family profiles must be sRGB no-ops"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn display_p3_profile_expands_red_and_keeps_grays_neutral_in_qcms() {
+        let icc = synthesize_nclx_icc(12, 13, 1).expect("expected synthesized ICC");
+
+        // P3 red is more saturated than sRGB red, so mapping into sRGB must
+        // push the red channel up (measured 200 -> 219) without bleeding into
+        // green/blue.
+        let red = qcms_through_to_srgb(&icc, [200, 0, 0]);
+        assert!(
+            (210..=228).contains(&red[0]) && red[1] <= 3 && red[2] <= 3,
+            "P3 (200,0,0) rendered as {red:?}"
+        );
+
+        let gray = qcms_through_to_srgb(&icc, [128, 128, 128]);
+        for channel in gray {
+            assert!(
+                channel.abs_diff(128) <= 1,
+                "P3 gray must stay neutral, got {gray:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pq_profile_is_not_an_srgb_identity_in_qcms() {
+        let icc = synthesize_nclx_icc(9, 16, 9).expect("expected synthesized ICC");
+        let out = qcms_through_to_srgb(&icc, [128, 128, 128]);
+        assert!(
+            out[0].abs_diff(128) > 50,
+            "PQ gray 128 rendered as {out:?}; the PQ curve must be honoured, not aliased"
+        );
+    }
+
+    #[test]
+    fn all_synthesized_profiles_parse_and_transform_in_qcms() {
+        let mut checked = 0;
+        for primaries in [1u16, 4, 5, 6, 7, 8, 9, 10, 11, 12, 22] {
+            for transfer in [1u16, 4, 5, 6, 7, 8, 13, 14, 15, 16, 18] {
+                let Some(icc) = synthesize_nclx_icc(primaries, transfer, 1) else {
+                    continue;
+                };
+                let profile = qcms::Profile::new_from_slice(&icc, false).unwrap_or_else(|| {
+                    panic!("qcms rejected synthesized ICC for primaries {primaries} transfer {transfer}")
+                });
+                assert!(
+                    qcms::Transform::new(
+                        &profile,
+                        &qcms::Profile::new_sRGB(),
+                        qcms::DataType::RGB8,
+                        qcms::Intent::Perceptual,
+                    )
+                    .is_some(),
+                    "qcms could not build a transform for primaries {primaries} transfer {transfer}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 50, "sweep only produced {checked} profiles");
+    }
+
     #[test]
     fn remaps_bt709_family_transfers_to_srgb() {
         // H.273 codes 1/6/14/15 share the 709 OETF; still-image consumers
