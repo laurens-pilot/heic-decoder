@@ -26,6 +26,13 @@ Changes to the HEIC decoder should be regression-tested with a default-corpus
 `verify` run, which covers all three. None of the corpora are ever checked
 into this repository.
 
+CI runs this on every pull request (`.github/workflows/tests.yml`): a `lint`
+job (`cargo fmt --check`, clippy, `cargo test`) and a `verify` job that
+performs the full default-corpus correctness pass, including stress-corpus
+generation. The workflow pins the libheif and ente test-fixtures commits it
+fetches; bump those pins in the workflow to move the CI validator or corpus
+forward deliberately.
+
 - pixel-for-pixel PNG comparison against an external `heif-dec` validator
 - embedded ICC colour-profile comparison against the validator's PNG output:
   when `heif-dec` embeds a profile, the Rust PNG must carry byte-identical

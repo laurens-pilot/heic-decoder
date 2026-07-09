@@ -1,0 +1,85 @@
+name: "Tests"
+
+on:
+    workflow_dispatch:
+    pull_request:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    lint:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        env:
+            RUSTFLAGS: -D warnings
+        steps:
+            - name: Checkout
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+            - run: cargo fmt --check
+
+            - run: cargo clippy --all-targets --all-features --locked
+
+            - run: cargo test --all-features --locked
+
+    # Full TESTING.md correctness pass: pixel-for-pixel and ICC-profile
+    # comparison against a pinned heif-dec validator over the libheif corpus,
+    # the ente HEIC fixtures, and the generated HEVC stress corpus.
+    verify:
+        runs-on: ubuntu-latest
+        timeout-minutes: 90
+        env:
+            # Validator source, two thirds of the corpus, and the stderr text
+            # the expected-failure allowlists match against all come from this
+            # checkout; bump the pin deliberately.
+            LIBHEIF_PIN: 78638f4fe417e49f2b129f42ae691a4954560bbd
+            # HEIC fixture corpus (media/heic/v1/files); bump to pick up
+            # fixtures added upstream.
+            ENTE_FIXTURES_PIN: 13c7cf83717140be20b32e6fbb178d5f15ea09ea
+        steps:
+            - name: Checkout
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+            - name: Install system dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y cmake pkg-config ffmpeg \
+                      libde265-dev libx265-dev libaom-dev libdav1d-dev \
+                      libopenjp2-7-dev libjpeg-dev libbrotli-dev zlib1g-dev
+
+            - name: Fetch pinned libheif (validator source and corpus)
+              run: |
+                  git init --quiet .heic-test-assets/libheif
+                  git -C .heic-test-assets/libheif remote add origin https://github.com/strukturag/libheif.git
+                  git -C .heic-test-assets/libheif fetch --quiet --depth 1 origin "$LIBHEIF_PIN"
+                  git -C .heic-test-assets/libheif checkout --quiet FETCH_HEAD
+
+            - name: Fetch pinned ente test-fixtures (HEIC corpus)
+              run: |
+                  git init --quiet .heic-test-assets/ente-test-fixtures
+                  git -C .heic-test-assets/ente-test-fixtures remote add origin https://github.com/ente/test-fixtures.git
+                  git -C .heic-test-assets/ente-test-fixtures sparse-checkout set media/heic/v1/files
+                  git -C .heic-test-assets/ente-test-fixtures fetch --quiet --depth 1 --filter=blob:none origin "$ENTE_FIXTURES_PIN"
+                  git -C .heic-test-assets/ente-test-fixtures checkout --quiet FETCH_HEAD
+
+            - name: Build validator and run quick smoke pass
+              run: scripts/heic_tests.sh verify --quick
+
+            - name: Generate HEVC stress corpus
+              run: scripts/heic_tests.sh gen-stress
+
+            - name: Full correctness pass
+              run: scripts/heic_tests.sh verify --full --require-exts heic,avif
+
+            - name: Upload verify report
+              if: failure()
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+              with:
+                  name: verify-report
+                  path: .heic-test-runs/verify/run/report.txt
+                  if-no-files-found: ignore
