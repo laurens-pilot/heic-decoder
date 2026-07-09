@@ -367,7 +367,6 @@ impl DecodedFrame {
                     255
                 };
                 bgra.push(alpha);
-
             }
         }
 
@@ -623,7 +622,6 @@ impl DecodedFrame {
                     255
                 };
                 rgba.push(alpha);
-
             }
         }
 

@@ -151,7 +151,58 @@ publish = false
 [dependencies]
 heic_decoder = { path = "$root_toml", features = ["image-integration"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+png = "0.18"
 EOF
+
+  # Seed the helper workspace with the root lockfile so helper builds resolve
+  # the same dependency versions (notably the rav1d git branch) as the crate.
+  if [[ -f "$ROOT_DIR/Cargo.lock" ]]; then
+    cp "$ROOT_DIR/Cargo.lock" "$HELPER_DIR/Cargo.lock"
+  fi
+
+  cat > "$HELPER_DIR/src/bin/heif-png-icc.rs" <<'RS'
+use std::borrow::Cow;
+use std::fs::File;
+use std::io::BufReader;
+use std::process::ExitCode;
+
+/// Extracts the decompressed iCCP colour profile from a PNG.
+///
+/// Exit codes: 0 = profile written to the output path, 3 = the PNG carries
+/// no profile, 1 = the PNG could not be read, 2 = usage error.
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 3 {
+        eprintln!("Usage: {} <input.png> <output.icc>", args[0]);
+        return ExitCode::from(2);
+    }
+
+    let file = match File::open(&args[1]) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("could not open {}: {error}", args[1]);
+            return ExitCode::from(1);
+        }
+    };
+    let reader = match png::Decoder::new(BufReader::new(file)).read_info() {
+        Ok(reader) => reader,
+        Err(error) => {
+            eprintln!("could not parse {}: {error}", args[1]);
+            return ExitCode::from(1);
+        }
+    };
+    let Some(profile) = reader.info().icc_profile.as_ref().map(Cow::as_ref) else {
+        return ExitCode::from(3);
+    };
+    match std::fs::write(&args[2], profile) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("could not write {}: {error}", args[2]);
+            ExitCode::from(1)
+        }
+    }
+}
+RS
 
   cat > "$HELPER_DIR/src/bin/heif-decode.rs" <<'RS'
 use heic_decoder::DecodeGuardrails;
@@ -921,6 +972,44 @@ png_to_rgba() {
   ffmpeg -v error -y -i "$1" -map 0:v:0 -f rawvideo -pix_fmt rgba "$2"
 }
 
+# Colour-profile oracle check: heif-dec embeds the container's raw ICC
+# profile in its PNG output, so whenever the validator PNG carries a profile
+# the Rust PNG must carry byte-identical profile data. A Rust-only profile
+# is allowed and expected: the Rust decoder synthesizes an ICC profile from
+# nclx colour information, which heif-dec does not embed.
+# Prints a failure description and returns 1 on mismatch.
+compare_png_icc() {
+  local ref_png="$1" rust_png="$2" prefix="$3"
+  local ref_icc="$prefix.ref.icc" rust_icc="$prefix.rust.icc"
+  local ref_status=0 rust_status=0
+  "$HELPER_BIN_DIR/heif-png-icc" "$ref_png" "$ref_icc" 2>/dev/null || ref_status=$?
+  "$HELPER_BIN_DIR/heif-png-icc" "$rust_png" "$rust_icc" 2>/dev/null || rust_status=$?
+
+  if [[ "$ref_status" -ne 0 && "$ref_status" -ne 3 ]]; then
+    echo "could not read validator PNG ICC profile (status=$ref_status)"
+    return 1
+  fi
+  if [[ "$rust_status" -ne 0 && "$rust_status" -ne 3 ]]; then
+    echo "could not read rust PNG ICC profile (status=$rust_status)"
+    return 1
+  fi
+  if [[ "$ref_status" -eq 3 ]]; then
+    return 0
+  fi
+  if [[ "$rust_status" -eq 3 ]]; then
+    echo "icc profile missing: validator PNG embeds one, rust PNG has none"
+    return 1
+  fi
+  if ! cmp -s "$ref_icc" "$rust_icc"; then
+    local ref_hash rust_hash
+    ref_hash="$(shasum -a 256 "$ref_icc" | awk '{print $1}')"
+    rust_hash="$(shasum -a 256 "$rust_icc" | awk '{print $1}')"
+    echo "icc profile mismatch ref=$ref_hash rust=$rust_hash"
+    return 1
+  fi
+  return 0
+}
+
 float_add() {
   awk -v a="$1" -v b="$2" 'BEGIN { printf "%.8f", a + b }'
 }
@@ -1183,8 +1272,15 @@ EOF
     fi
 
     if cmp -s "$ref_raw" "$rust_raw"; then
-      passed=$((passed + 1))
-      echo "PASS $rel_path" >> "$report_file"
+      local icc_failure
+      if icc_failure="$(compare_png_icc "$ref_actual" "$rust_actual" "$tmp_dir/$id")"; then
+        passed=$((passed + 1))
+        echo "PASS $rel_path" >> "$report_file"
+      else
+        failed=$((failed + 1))
+        failures+=("$rel_path :: $icc_failure")
+        echo "FAIL $rel_path ($icc_failure)" >> "$report_file"
+      fi
     else
       failed=$((failed + 1))
       local ref_hash rust_hash
@@ -1195,7 +1291,7 @@ EOF
     fi
 
     if [[ "$keep_artifacts" -eq 0 ]]; then
-      rm -f "$ref_raw" "$rust_raw"
+      rm -f "$ref_raw" "$rust_raw" "$tmp_dir/$id.ref.icc" "$tmp_dir/$id.rust.icc"
     fi
   done
 

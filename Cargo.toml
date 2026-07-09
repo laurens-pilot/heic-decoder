@@ -34,3 +34,6 @@ rav1d = { git = "https://github.com/ente-io/rav1d.git", branch = "arm32_stable",
 ] }
 safe_unaligned_simd = "0.2"
 scuffle-h265 = "0.2.2"
+
+[dev-dependencies]
+qcms = "0.3.0"
