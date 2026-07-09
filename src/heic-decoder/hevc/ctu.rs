@@ -895,24 +895,23 @@ impl<'a> SliceContext<'a> {
                 // Decode chroma mode(s). For 4:4:4 (ChromaArrayType 3) one
                 // chroma mode is coded per PU (H.265 7.3.8.5); otherwise a
                 // single mode covers the CU.
-                let chroma_mode = if self.sps.chroma_format_idc == 3
-                    && !self.sps.separate_colour_plane_flag
-                {
-                    let c0 = self.decode_intra_chroma_mode(luma_mode_0)?;
-                    self.store_intra_chroma_mode(x0, y0, log2_pu_size, c0);
-                    let c1 = self.decode_intra_chroma_mode(luma_mode_1)?;
-                    self.store_intra_chroma_mode(x0 + half, y0, log2_pu_size, c1);
-                    let c2 = self.decode_intra_chroma_mode(luma_mode_2)?;
-                    self.store_intra_chroma_mode(x0, y0 + half, log2_pu_size, c2);
-                    let c3 = self.decode_intra_chroma_mode(luma_mode_3)?;
-                    self.store_intra_chroma_mode(x0 + half, y0 + half, log2_pu_size, c3);
-                    c0
-                } else {
-                    let chroma_mode = self.decode_intra_chroma_mode(luma_mode_0)?;
-                    // Store chroma mode for the whole CU region
-                    self.store_intra_chroma_mode(x0, y0, log2_cb_size, chroma_mode);
-                    chroma_mode
-                };
+                let chroma_mode =
+                    if self.sps.chroma_format_idc == 3 && !self.sps.separate_colour_plane_flag {
+                        let c0 = self.decode_intra_chroma_mode(luma_mode_0)?;
+                        self.store_intra_chroma_mode(x0, y0, log2_pu_size, c0);
+                        let c1 = self.decode_intra_chroma_mode(luma_mode_1)?;
+                        self.store_intra_chroma_mode(x0 + half, y0, log2_pu_size, c1);
+                        let c2 = self.decode_intra_chroma_mode(luma_mode_2)?;
+                        self.store_intra_chroma_mode(x0, y0 + half, log2_pu_size, c2);
+                        let c3 = self.decode_intra_chroma_mode(luma_mode_3)?;
+                        self.store_intra_chroma_mode(x0 + half, y0 + half, log2_pu_size, c3);
+                        c0
+                    } else {
+                        let chroma_mode = self.decode_intra_chroma_mode(luma_mode_0)?;
+                        // Store chroma mode for the whole CU region
+                        self.store_intra_chroma_mode(x0, y0, log2_cb_size, chroma_mode);
+                        chroma_mode
+                    };
 
                 // NOTE: Prediction is NOT done here. It happens in decode_transform_unit_leaf
                 // and the 8x8→4x4 chroma split handler, so each TU is predicted →
@@ -1059,10 +1058,10 @@ impl<'a> SliceContext<'a> {
 
             let cb = if cbf_cb_parent != 0 {
                 let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
-                let mut val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? as u8;
+                let mut val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
                 se_trace("cbf_cb", val as i64, &self.cabac);
                 if decode_extra_422_cbf {
-                    let extra = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? as u8;
+                    let extra = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
                     se_trace("cbf_cb", extra as i64, &self.cabac);
                     val |= extra << 1;
                 }
@@ -1072,10 +1071,10 @@ impl<'a> SliceContext<'a> {
             };
             let cr = if cbf_cr_parent != 0 {
                 let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
-                let mut val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? as u8;
+                let mut val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
                 se_trace("cbf_cr", val as i64, &self.cabac);
                 if decode_extra_422_cbf {
-                    let extra = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? as u8;
+                    let extra = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
                     se_trace("cbf_cr", extra as i64, &self.cabac);
                     val |= extra << 1;
                 }
@@ -1248,8 +1247,12 @@ impl<'a> SliceContext<'a> {
         // This ensures each TU reads reconstructed neighbors from prior TUs
         intra::predict_intra(frame, x0, y0, log2_size, actual_luma_mode, 0, sis);
 
-        let scan_order =
-            residual::get_scan_order(log2_size, actual_luma_mode.as_u8(), 0, self.sps.chroma_format_idc);
+        let scan_order = residual::get_scan_order(
+            log2_size,
+            actual_luma_mode.as_u8(),
+            0,
+            self.sps.chroma_format_idc,
+        );
 
         // Decode and apply luma residuals (adds to prediction already in frame)
         if cbf_luma {
@@ -1317,6 +1320,7 @@ impl<'a> SliceContext<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_leaf_chroma(
         &mut self,
         x0: u32,
@@ -1405,6 +1409,7 @@ impl<'a> SliceContext<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_chroma_block(
         &mut self,
         x0: u32,

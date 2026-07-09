@@ -1006,10 +1006,7 @@ fn parse_scaling_list_data(reader: &mut BitstreamReader<'_>) -> Result<ScalingLi
 }
 
 /// Skip the VUI fields after the colour description (H.265 E.2.1).
-fn skip_vui_remainder(
-    reader: &mut BitstreamReader<'_>,
-    max_sub_layers_minus1: u8,
-) -> Result<()> {
+fn skip_vui_remainder(reader: &mut BitstreamReader<'_>, max_sub_layers_minus1: u8) -> Result<()> {
     let chroma_loc_info_present_flag = reader.read_bit()? != 0;
     if chroma_loc_info_present_flag {
         let _chroma_sample_loc_type_top_field = reader.read_ue()?;
