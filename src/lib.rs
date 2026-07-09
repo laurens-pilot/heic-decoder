@@ -4175,13 +4175,30 @@ fn decode_primary_heic_grid_to_rgba_image(
     let conversion_ycbcr_matrix =
         ycbcr_matrix_override_from_primary_colr(&grid_data.colr).unwrap_or(reference_ycbcr_matrix);
     let source_bit_depth = heic_bit_depth_for_png_conversion(&first_tile)?;
+    // Direct orientation is safe for opaque grids. Alpha and clean aperture
+    // stay on the existing source-coordinate transform path.
+    let direct_orientation_transform = if auxiliary_alpha.is_none() {
+        rgba_orientation_transform_from_primary_transforms(
+            descriptor.output_width,
+            descriptor.output_height,
+            transforms,
+        )?
+    } else {
+        None
+    };
+    let output_width = direct_orientation_transform
+        .as_ref()
+        .map_or(descriptor.output_width, |transform| {
+            transform.destination_width
+        });
+    let output_height = direct_orientation_transform
+        .as_ref()
+        .map_or(descriptor.output_height, |transform| {
+            transform.destination_height
+        });
 
     if source_bit_depth <= 8 {
-        let mut output =
-            vec![
-                0_u8;
-                checked_rgba_sample_count(descriptor.output_width, descriptor.output_height)?
-            ];
+        let mut output = vec![0_u8; checked_rgba_sample_count(output_width, output_height)?];
         paste_heic_grid_tiles_to_rgba8(
             grid_data,
             first_tile,
@@ -4195,7 +4212,17 @@ fn decode_primary_heic_grid_to_rgba_image(
             reference_ycbcr_matrix,
             conversion_ycbcr_range,
             conversion_ycbcr_matrix,
+            direct_orientation_transform.as_ref(),
         )?;
+        if direct_orientation_transform.is_some() {
+            return Ok(DecodedRgbaImage {
+                width: output_width,
+                height: output_height,
+                source_bit_depth,
+                pixels: DecodedRgbaPixels::U8(output),
+                icc_profile,
+            });
+        }
         if let Some(alpha) = auxiliary_alpha {
             apply_auxiliary_alpha_to_rgba8(
                 &mut output,
@@ -4219,8 +4246,7 @@ fn decode_primary_heic_grid_to_rgba_image(
         });
     }
 
-    let mut output =
-        vec![0_u16; checked_rgba_sample_count(descriptor.output_width, descriptor.output_height)?];
+    let mut output = vec![0_u16; checked_rgba_sample_count(output_width, output_height)?];
     paste_heic_grid_tiles_to_rgba16(
         grid_data,
         first_tile,
@@ -4234,7 +4260,17 @@ fn decode_primary_heic_grid_to_rgba_image(
         reference_ycbcr_matrix,
         conversion_ycbcr_range,
         conversion_ycbcr_matrix,
+        direct_orientation_transform.as_ref(),
     )?;
+    if direct_orientation_transform.is_some() {
+        return Ok(DecodedRgbaImage {
+            width: output_width,
+            height: output_height,
+            source_bit_depth,
+            pixels: DecodedRgbaPixels::U16(output),
+            icc_profile,
+        });
+    }
     if let Some(alpha) = auxiliary_alpha {
         apply_auxiliary_alpha_to_rgba16(
             &mut output,
@@ -4340,6 +4376,7 @@ fn paste_heic_grid_tiles_to_rgba8(
     reference_ycbcr_matrix: YCbCrMatrixCoefficients,
     conversion_ycbcr_range: YCbCrRange,
     conversion_ycbcr_matrix: YCbCrMatrixCoefficients,
+    orientation_transform: Option<&RgbaOrientationTransform>,
 ) -> Result<(), DecodeError> {
     paste_heic_grid_tiles_to_rgba(
         grid_data,
@@ -4354,6 +4391,7 @@ fn paste_heic_grid_tiles_to_rgba8(
         reference_ycbcr_matrix,
         conversion_ycbcr_range,
         conversion_ycbcr_matrix,
+        orientation_transform,
         convert_heic_to_rgba8_into,
     )
 }
@@ -4372,6 +4410,7 @@ fn paste_heic_grid_tiles_to_rgba16(
     reference_ycbcr_matrix: YCbCrMatrixCoefficients,
     conversion_ycbcr_range: YCbCrRange,
     conversion_ycbcr_matrix: YCbCrMatrixCoefficients,
+    orientation_transform: Option<&RgbaOrientationTransform>,
 ) -> Result<(), DecodeError> {
     paste_heic_grid_tiles_to_rgba(
         grid_data,
@@ -4386,6 +4425,7 @@ fn paste_heic_grid_tiles_to_rgba16(
         reference_ycbcr_matrix,
         conversion_ycbcr_range,
         conversion_ycbcr_matrix,
+        orientation_transform,
         convert_heic_to_rgba16_into,
     )
 }
@@ -4404,6 +4444,7 @@ fn paste_heic_grid_tiles_to_rgba<T: Copy>(
     reference_ycbcr_matrix: YCbCrMatrixCoefficients,
     conversion_ycbcr_range: YCbCrRange,
     conversion_ycbcr_matrix: YCbCrMatrixCoefficients,
+    orientation_transform: Option<&RgbaOrientationTransform>,
     convert_tile: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
 ) -> Result<(), DecodeError> {
     let descriptor = &grid_data.descriptor;
@@ -4437,17 +4478,30 @@ fn paste_heic_grid_tiles_to_rgba<T: Copy>(
         let row = tile_index / columns;
         let column = tile_index % columns;
         let (x_origin, y_origin) = heic_grid_tile_origin(tile_width, tile_height, row, column)?;
-        paste_rgba_tile_with_clip(
-            &tile_pixels,
-            tile.width,
-            tile.height,
-            output,
-            descriptor.output_width,
-            descriptor.output_height,
-            x_origin,
-            y_origin,
-            "grid tile RGBA",
-        )?;
+        if let Some(orientation_transform) = orientation_transform {
+            paste_transformed_rgba_tile_with_clip(
+                &tile_pixels,
+                tile.width,
+                tile.height,
+                output,
+                orientation_transform,
+                x_origin,
+                y_origin,
+                "grid tile RGBA",
+            )?;
+        } else {
+            paste_rgba_tile_with_clip(
+                &tile_pixels,
+                tile.width,
+                tile.height,
+                output,
+                descriptor.output_width,
+                descriptor.output_height,
+                x_origin,
+                y_origin,
+                "grid tile RGBA",
+            )?;
+        }
     }
 
     Ok(())
@@ -4489,6 +4543,283 @@ fn heic_grid_tile_origin(
     })?;
 
     Ok((x_origin, y_origin))
+}
+
+#[derive(Clone, Debug)]
+struct RgbaOrientationTransform {
+    source_width: u32,
+    source_height: u32,
+    source_width_usize: usize,
+    source_height_usize: usize,
+    destination_width: u32,
+    destination_height: u32,
+    destination_width_usize: usize,
+    destination_height_usize: usize,
+    destination_x_from_source_x: i64,
+    destination_x_from_source_y: i64,
+    destination_x_offset: i64,
+    destination_y_from_source_x: i64,
+    destination_y_from_source_y: i64,
+    destination_y_offset: i64,
+}
+
+impl RgbaOrientationTransform {
+    fn map_source_pixel(&self, x: usize, y: usize) -> Result<(usize, usize), DecodeError> {
+        let x_i64 = i64::try_from(x).map_err(|_| {
+            DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
+                stage: "direct grid source",
+                x,
+                y,
+                width: self.source_width,
+                height: self.source_height,
+            })
+        })?;
+        let y_i64 = i64::try_from(y).map_err(|_| {
+            DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
+                stage: "direct grid source",
+                x,
+                y,
+                width: self.source_width,
+                height: self.source_height,
+            })
+        })?;
+        let destination_x = self.destination_x_from_source_x * x_i64
+            + self.destination_x_from_source_y * y_i64
+            + self.destination_x_offset;
+        let destination_y = self.destination_y_from_source_x * x_i64
+            + self.destination_y_from_source_y * y_i64
+            + self.destination_y_offset;
+
+        Ok((
+            mapped_orientation_coordinate_to_usize(
+                destination_x,
+                self.destination_width_usize,
+                "direct grid destination x",
+                x,
+                y,
+                self.destination_width,
+                self.destination_height,
+            )?,
+            mapped_orientation_coordinate_to_usize(
+                destination_y,
+                self.destination_height_usize,
+                "direct grid destination y",
+                x,
+                y,
+                self.destination_width,
+                self.destination_height,
+            )?,
+        ))
+    }
+}
+
+fn mapped_orientation_coordinate_to_usize(
+    value: i64,
+    limit: usize,
+    stage: &'static str,
+    x: usize,
+    y: usize,
+    width: u32,
+    height: u32,
+) -> Result<usize, DecodeError> {
+    if value < 0 {
+        return Err(DecodeError::TransformGuard(
+            TransformGuardError::PixelIndexOverflow {
+                stage,
+                x,
+                y,
+                width,
+                height,
+            },
+        ));
+    }
+    let coordinate = usize::try_from(value).map_err(|_| {
+        DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
+            stage,
+            x,
+            y,
+            width,
+            height,
+        })
+    })?;
+    if coordinate >= limit {
+        return Err(DecodeError::TransformGuard(
+            TransformGuardError::PixelIndexOverflow {
+                stage,
+                x,
+                y,
+                width,
+                height,
+            },
+        ));
+    }
+    Ok(coordinate)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RgbaOrientationAxis {
+    from_source_x: i64,
+    from_source_y: i64,
+    offset: i64,
+}
+
+fn flipped_orientation_axis(axis: RgbaOrientationAxis, dimension: u32) -> RgbaOrientationAxis {
+    RgbaOrientationAxis {
+        from_source_x: -axis.from_source_x,
+        from_source_y: -axis.from_source_y,
+        offset: i64::from(dimension) - 1 - axis.offset,
+    }
+}
+
+fn rotate_orientation_axes_90_ccw(
+    x_axis: RgbaOrientationAxis,
+    y_axis: RgbaOrientationAxis,
+    width: u32,
+) -> (RgbaOrientationAxis, RgbaOrientationAxis) {
+    (y_axis, flipped_orientation_axis(x_axis, width))
+}
+
+fn rotate_orientation_axes_270_ccw(
+    x_axis: RgbaOrientationAxis,
+    y_axis: RgbaOrientationAxis,
+    height: u32,
+) -> (RgbaOrientationAxis, RgbaOrientationAxis) {
+    (flipped_orientation_axis(y_axis, height), x_axis)
+}
+
+fn rotate_orientation_axes_180(
+    x_axis: RgbaOrientationAxis,
+    y_axis: RgbaOrientationAxis,
+    width: u32,
+    height: u32,
+) -> (RgbaOrientationAxis, RgbaOrientationAxis) {
+    (
+        flipped_orientation_axis(x_axis, width),
+        flipped_orientation_axis(y_axis, height),
+    )
+}
+
+fn transform_dimension_to_usize(
+    stage: &'static str,
+    dimension: &'static str,
+    value: u32,
+) -> Result<usize, DecodeError> {
+    usize::try_from(value).map_err(|_| {
+        DecodeError::TransformGuard(TransformGuardError::DimensionTooLargeForPlatform {
+            stage,
+            dimension,
+            value: u64::from(value),
+        })
+    })
+}
+
+fn rgba_orientation_transform_from_primary_transforms(
+    width: u32,
+    height: u32,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+) -> Result<Option<RgbaOrientationTransform>, DecodeError> {
+    if width == 0 || height == 0 {
+        return Err(DecodeError::TransformGuard(
+            TransformGuardError::EmptyImageGeometry { width, height },
+        ));
+    }
+
+    let source_width_usize =
+        transform_dimension_to_usize("direct grid orientation", "source width", width)?;
+    let source_height_usize =
+        transform_dimension_to_usize("direct grid orientation", "source height", height)?;
+    let mut current_width = width;
+    let mut current_height = height;
+    let mut effective = false;
+    let mut x_axis = RgbaOrientationAxis {
+        from_source_x: 1,
+        from_source_y: 0,
+        offset: 0,
+    };
+    let mut y_axis = RgbaOrientationAxis {
+        from_source_x: 0,
+        from_source_y: 1,
+        offset: 0,
+    };
+
+    for transform in transforms {
+        match *transform {
+            isobmff::PrimaryItemTransformProperty::CleanAperture(_) => return Ok(None),
+            isobmff::PrimaryItemTransformProperty::Rotation(rotation) => {
+                let rotation_ccw_degrees = rotation.rotation_ccw_degrees % 360;
+                if rotation_ccw_degrees == 0 {
+                    continue;
+                }
+                match rotation_ccw_degrees {
+                    90 | 180 | 270 => {}
+                    _ => {
+                        return Err(DecodeError::TransformGuard(
+                            TransformGuardError::UnsupportedRotation {
+                                rotation_ccw_degrees: rotation.rotation_ccw_degrees,
+                            },
+                        ));
+                    }
+                }
+                effective = true;
+                (x_axis, y_axis) = match rotation_ccw_degrees {
+                    90 => {
+                        let axes = rotate_orientation_axes_90_ccw(x_axis, y_axis, current_width);
+                        std::mem::swap(&mut current_width, &mut current_height);
+                        axes
+                    }
+                    180 => {
+                        rotate_orientation_axes_180(x_axis, y_axis, current_width, current_height)
+                    }
+                    270 => {
+                        let axes = rotate_orientation_axes_270_ccw(x_axis, y_axis, current_height);
+                        std::mem::swap(&mut current_width, &mut current_height);
+                        axes
+                    }
+                    _ => unreachable!("rotation angle was validated above"),
+                };
+            }
+            isobmff::PrimaryItemTransformProperty::Mirror(mirror) => {
+                effective = true;
+                match mirror.direction {
+                    isobmff::ImageMirrorDirection::Horizontal => {
+                        x_axis = flipped_orientation_axis(x_axis, current_width);
+                    }
+                    isobmff::ImageMirrorDirection::Vertical => {
+                        y_axis = flipped_orientation_axis(y_axis, current_height);
+                    }
+                }
+            }
+        }
+    }
+
+    if !effective {
+        return Ok(None);
+    }
+
+    Ok(Some(RgbaOrientationTransform {
+        source_width: width,
+        source_height: height,
+        source_width_usize,
+        source_height_usize,
+        destination_width: current_width,
+        destination_height: current_height,
+        destination_width_usize: transform_dimension_to_usize(
+            "direct grid orientation",
+            "destination width",
+            current_width,
+        )?,
+        destination_height_usize: transform_dimension_to_usize(
+            "direct grid orientation",
+            "destination height",
+            current_height,
+        )?,
+        destination_x_from_source_x: x_axis.from_source_x,
+        destination_x_from_source_y: x_axis.from_source_y,
+        destination_x_offset: x_axis.offset,
+        destination_y_from_source_x: y_axis.from_source_x,
+        destination_y_from_source_y: y_axis.from_source_y,
+        destination_y_offset: y_axis.offset,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4612,6 +4943,151 @@ fn paste_rgba_tile_with_clip<T: Copy>(
 
         destination[destination_start..destination_end]
             .copy_from_slice(&source[source_start..source_end]);
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paste_transformed_rgba_tile_with_clip<T: Copy>(
+    source: &[T],
+    source_width: u32,
+    source_height: u32,
+    destination: &mut [T],
+    orientation_transform: &RgbaOrientationTransform,
+    x_origin: u32,
+    y_origin: u32,
+    plane: &'static str,
+) -> Result<(), DecodeError> {
+    if x_origin >= orientation_transform.source_width
+        || y_origin >= orientation_transform.source_height
+    {
+        return Ok(());
+    }
+
+    let source_width_usize =
+        usize::try_from(source_width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("{plane} width {source_width} cannot be represented"),
+        })?;
+    let source_height_usize =
+        usize::try_from(source_height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("{plane} height {source_height} cannot be represented"),
+        })?;
+    let x_origin_usize =
+        usize::try_from(x_origin).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("{plane} x-origin {x_origin} cannot be represented"),
+        })?;
+    let y_origin_usize =
+        usize::try_from(y_origin).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("{plane} y-origin {y_origin} cannot be represented"),
+        })?;
+
+    let source_samples = source_width_usize
+        .checked_mul(source_height_usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "{plane} source sample count overflow for {source_width}x{source_height}"
+            ),
+        })?;
+    if source.len() != source_samples {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "{plane} source has {} samples, expected {source_samples}",
+                source.len()
+            ),
+        }
+        .into());
+    }
+
+    let destination_samples = orientation_transform
+        .destination_width_usize
+        .checked_mul(orientation_transform.destination_height_usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "{plane} destination sample count overflow for {}x{}",
+                orientation_transform.destination_width, orientation_transform.destination_height
+            ),
+        })?;
+    if destination.len() != destination_samples {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "{plane} destination has {} samples, expected {destination_samples}",
+                destination.len()
+            ),
+        }
+        .into());
+    }
+
+    let remaining_width = orientation_transform.source_width_usize - x_origin_usize;
+    let copy_width = source_width_usize.min(remaining_width);
+    if copy_width == 0 {
+        return Ok(());
+    }
+    let max_rows =
+        source_height_usize.min(orientation_transform.source_height_usize - y_origin_usize);
+
+    for row in 0..max_rows {
+        let source_row_start = row
+            .checked_mul(source_width_usize)
+            .and_then(|offset| offset.checked_mul(4))
+            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!("{plane} source row index overflow at row {row}"),
+            })?;
+        let source_y = y_origin_usize.checked_add(row).ok_or_else(|| {
+            DecodeHeicError::InvalidDecodedFrame {
+                detail: format!("{plane} source y-coordinate overflow at row {row}"),
+            }
+        })?;
+        for column in 0..copy_width {
+            let source_x = x_origin_usize.checked_add(column).ok_or_else(|| {
+                DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!("{plane} source x-coordinate overflow at column {column}"),
+                }
+            })?;
+            let source_start = source_row_start
+                .checked_add(column.checked_mul(4).ok_or_else(|| {
+                    DecodeHeicError::InvalidDecodedFrame {
+                        detail: format!("{plane} source column sample overflow at {column}"),
+                    }
+                })?)
+                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!("{plane} source sample index overflow at column {column}"),
+                })?;
+            let source_end = source_start.checked_add(4).ok_or_else(|| {
+                DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!("{plane} source sample end overflow at column {column}"),
+                }
+            })?;
+            let (destination_x, destination_y) =
+                orientation_transform.map_source_pixel(source_x, source_y)?;
+            let destination_start = destination_y
+                .checked_mul(orientation_transform.destination_width_usize)
+                .and_then(|offset| offset.checked_add(destination_x))
+                .and_then(|offset| offset.checked_mul(4))
+                .ok_or({
+                    DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
+                        stage: "direct grid destination",
+                        x: destination_x,
+                        y: destination_y,
+                        width: orientation_transform.destination_width,
+                        height: orientation_transform.destination_height,
+                    })
+                })?;
+            let destination_end = destination_start.checked_add(4).ok_or({
+                DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
+                    stage: "direct grid destination",
+                    x: destination_x,
+                    y: destination_y,
+                    width: orientation_transform.destination_width,
+                    height: orientation_transform.destination_height,
+                })
+            })?;
+
+            destination[destination_start..destination_end]
+                .copy_from_slice(&source[source_start..source_end]);
+        }
     }
 
     Ok(())
@@ -9911,6 +10387,102 @@ mod tests {
         let mut pixel = rgb.to_vec();
         transform.apply(&mut pixel);
         [pixel[0], pixel[1], pixel[2]]
+    }
+
+    fn test_rgba_pixels(width: u32, height: u32, base: u8) -> Vec<u8> {
+        let mut pixels = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                let value = base.wrapping_add((y * width + x) as u8);
+                pixels.extend_from_slice(&[
+                    value,
+                    value.wrapping_add(1),
+                    value.wrapping_add(2),
+                    value.wrapping_add(3),
+                ]);
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn direct_grid_orientation_paste_matches_rgba_transform_path() {
+        let transforms = [
+            isobmff::PrimaryItemTransformProperty::Mirror(isobmff::ImageMirrorProperty {
+                direction: isobmff::ImageMirrorDirection::Horizontal,
+            }),
+            isobmff::PrimaryItemTransformProperty::Rotation(isobmff::ImageRotationProperty {
+                rotation_ccw_degrees: 90,
+            }),
+        ];
+        let orientation_transform =
+            super::rgba_orientation_transform_from_primary_transforms(3, 2, &transforms)
+                .expect("orientation transform should parse")
+                .expect("orientation transform should be effective");
+
+        let left_tile = test_rgba_pixels(2, 2, 10);
+        let right_tile = test_rgba_pixels(2, 2, 40);
+        let mut untransformed = vec![0_u8; 3 * 2 * 4];
+        super::paste_rgba_tile_with_clip(
+            &left_tile,
+            2,
+            2,
+            &mut untransformed,
+            3,
+            2,
+            0,
+            0,
+            "test RGBA",
+        )
+        .expect("left tile paste should succeed");
+        super::paste_rgba_tile_with_clip(
+            &right_tile,
+            2,
+            2,
+            &mut untransformed,
+            3,
+            2,
+            2,
+            0,
+            "test RGBA",
+        )
+        .expect("right tile paste should succeed");
+
+        let mut direct = vec![
+            0_u8;
+            orientation_transform.destination_width as usize
+                * orientation_transform.destination_height as usize
+                * 4
+        ];
+        super::paste_transformed_rgba_tile_with_clip(
+            &left_tile,
+            2,
+            2,
+            &mut direct,
+            &orientation_transform,
+            0,
+            0,
+            "test RGBA",
+        )
+        .expect("left transformed paste should succeed");
+        super::paste_transformed_rgba_tile_with_clip(
+            &right_tile,
+            2,
+            2,
+            &mut direct,
+            &orientation_transform,
+            2,
+            0,
+            "test RGBA",
+        )
+        .expect("right transformed paste should succeed");
+
+        let (width, height, transformed) =
+            super::apply_primary_item_transforms_rgba(3, 2, untransformed, &transforms)
+                .expect("reference transform should succeed");
+        assert_eq!(width, orientation_transform.destination_width);
+        assert_eq!(height, orientation_transform.destination_height);
+        assert_eq!(direct, transformed);
     }
 
     #[test]
