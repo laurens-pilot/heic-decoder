@@ -8611,43 +8611,16 @@ fn decode_heif_bytes_to_rgba16_native_endian_bytes(
     )? {
         return Ok(());
     }
-
-    let transforms = isobmff::parse_primary_item_transform_properties(input)
-        .map_err(DecodeHeicError::ParsePrimaryTransforms)?
-        .transforms;
-    let mut source: Option<&mut dyn RandomAccessSource> = None;
-    let primary_with_grid =
-        isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?;
-    match primary_with_grid {
-        isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
-            let auxiliary_alpha = decode_primary_heic_grid_auxiliary_alpha(
-                input,
-                &mut source,
-                &grid_data,
-                &guardrails,
-            )?;
-            decode_primary_heic_grid_to_rgba16_native_endian_bytes(
-                &grid_data,
-                &transforms,
-                auxiliary_alpha.as_ref(),
-                out,
-            )
-        }
-        isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
-            let (decoded, auxiliary_alpha) = decode_primary_heic_coded_item_with_alpha(
-                input,
-                &mut source,
-                &item_data,
-                &guardrails,
-            )?;
-            decoded_heic_to_rgba16_native_endian_bytes(
-                decoded,
-                &transforms,
-                auxiliary_alpha.as_ref(),
-                out,
-            )
-        }
-    }
+    // The 16-bit functions write native-endian u16 samples into the byte
+    // slice, so they instantiate the shared dispatch at T = u8 just like the
+    // RGBA8 twin above.
+    decode_heif_bytes_to_rgba_slice(
+        input,
+        guardrails,
+        out,
+        decode_primary_heic_grid_to_rgba16_native_endian_bytes,
+        decoded_heic_to_rgba16_native_endian_bytes,
+    )
 }
 
 #[cfg(feature = "image-integration")]
