@@ -7004,6 +7004,7 @@ fn heic_grid_source_bit_depth_for_png_conversion(
 }
 
 /// RGBA storage width (8 or 16 bits per sample) for a HEIC source bit depth.
+#[cfg(feature = "image-integration")]
 fn heic_storage_bit_depth(source_bit_depth: u8) -> u8 {
     if source_bit_depth <= 8 { 8 } else { 16 }
 }
