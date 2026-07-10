@@ -9,12 +9,9 @@
 
 use crate::{
     DecodeError, DecodeGuardrails, DecodedRgbaImage, DecodedRgbaLayout, DecodedRgbaPixels,
-    HeifInputFamily, decode_bufread_to_rgba_with_guardrails,
-    decode_bytes_to_rgba_layout_with_hint_and_guardrails, decode_bytes_to_rgba_with_guardrails,
+    HeifInputFamily, decode_bytes_to_rgba_layout_with_hint_and_guardrails,
     decode_bytes_to_rgba8_slice_with_hint_and_guardrails,
     decode_bytes_to_rgba16_native_endian_bytes_with_hint_and_guardrails,
-    decode_path_to_rgba_with_guardrails, decode_read_to_rgba_with_guardrails,
-    decode_seekable_to_rgba_with_hint_and_guardrails,
 };
 use image::error::{
     DecodingError, ImageFormatHint, ParameterError, ParameterErrorKind, UnsupportedError,
@@ -26,8 +23,7 @@ use image::{ColorType, DynamicImage, ImageBuffer, ImageDecoder, ImageError, Imag
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
-use std::io::{BufRead, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Once;
 
 const HOOK_EXTENSION_HEIC: &str = "heic";
@@ -72,166 +68,6 @@ pub fn apply_exif_orientation_dynamic(image: DynamicImage, exif_orientation: u8)
         7 => image.fliph().rotate90(),
         8 => image.rotate270(),
         _ => image,
-    }
-}
-
-/// Dedicated `image::ImageDecoder` adapter backed by decoded RGBA samples.
-///
-/// This adapter decodes HEIF/HEIC/AVIF inputs directly into in-memory RGBA and
-/// exposes the buffer via the `image` crate's decoder trait without any PNG
-/// intermediate transcode.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HeifImageDecoder {
-    decoded: DecodedRgbaImage,
-}
-
-impl HeifImageDecoder {
-    /// Build an adapter from an already decoded RGBA image.
-    pub fn from_decoded(decoded: DecodedRgbaImage) -> ImageResult<Self> {
-        validate_decoded_rgba_image(&decoded)?;
-        Ok(Self { decoded })
-    }
-
-    /// Decode HEIF/HEIC/AVIF bytes into an `image::ImageDecoder` adapter.
-    pub fn from_bytes(input: &[u8]) -> ImageResult<Self> {
-        Self::from_bytes_with_guardrails(input, DecodeGuardrails::default())
-    }
-
-    /// Decode HEIF/HEIC/AVIF bytes into an `image::ImageDecoder` adapter with configurable guardrails.
-    pub fn from_bytes_with_guardrails(
-        input: &[u8],
-        guardrails: DecodeGuardrails,
-    ) -> ImageResult<Self> {
-        let decoded = decode_bytes_to_rgba_with_guardrails(input, guardrails)
-            .map_err(decode_error_to_image_error)?;
-        Self::from_decoded(decoded)
-    }
-
-    /// Decode a `Read` source into an `image::ImageDecoder` adapter.
-    pub fn from_read<R: Read>(input_reader: R) -> ImageResult<Self> {
-        Self::from_read_with_guardrails(input_reader, DecodeGuardrails::default())
-    }
-
-    /// Decode a `Read` source into an `image::ImageDecoder` adapter with configurable guardrails.
-    pub fn from_read_with_guardrails<R: Read>(
-        input_reader: R,
-        guardrails: DecodeGuardrails,
-    ) -> ImageResult<Self> {
-        let decoded = decode_read_to_rgba_with_guardrails(input_reader, guardrails)
-            .map_err(decode_error_to_image_error)?;
-        Self::from_decoded(decoded)
-    }
-
-    /// Decode a seekable `Read` source into an `image::ImageDecoder` adapter.
-    pub fn from_seekable<R: Read + Seek>(input_reader: R) -> ImageResult<Self> {
-        Self::from_seekable_with_guardrails(input_reader, DecodeGuardrails::default())
-    }
-
-    /// Decode a seekable `Read` source into an `image::ImageDecoder` adapter with configurable guardrails.
-    pub fn from_seekable_with_guardrails<R: Read + Seek>(
-        input_reader: R,
-        guardrails: DecodeGuardrails,
-    ) -> ImageResult<Self> {
-        Self::from_seekable_with_hint_and_guardrails(input_reader, None, guardrails)
-    }
-
-    /// Decode a `BufRead` source into an `image::ImageDecoder` adapter.
-    pub fn from_bufread<R: BufRead>(input_reader: R) -> ImageResult<Self> {
-        Self::from_bufread_with_guardrails(input_reader, DecodeGuardrails::default())
-    }
-
-    /// Decode a `BufRead` source into an `image::ImageDecoder` adapter with configurable guardrails.
-    pub fn from_bufread_with_guardrails<R: BufRead>(
-        input_reader: R,
-        guardrails: DecodeGuardrails,
-    ) -> ImageResult<Self> {
-        let decoded = decode_bufread_to_rgba_with_guardrails(input_reader, guardrails)
-            .map_err(decode_error_to_image_error)?;
-        Self::from_decoded(decoded)
-    }
-
-    /// Decode a file path into an `image::ImageDecoder` adapter.
-    pub fn from_path(input_path: &Path) -> ImageResult<Self> {
-        Self::from_path_with_guardrails(input_path, DecodeGuardrails::default())
-    }
-
-    /// Decode a file path into an `image::ImageDecoder` adapter with configurable guardrails.
-    pub fn from_path_with_guardrails(
-        input_path: &Path,
-        guardrails: DecodeGuardrails,
-    ) -> ImageResult<Self> {
-        let decoded = decode_path_to_rgba_with_guardrails(input_path, guardrails)
-            .map_err(decode_error_to_image_error)?;
-        Self::from_decoded(decoded)
-    }
-
-    /// Consume the adapter and return the owned decoded RGBA buffer.
-    pub fn into_decoded_rgba(self) -> DecodedRgbaImage {
-        self.decoded
-    }
-
-    fn from_seekable_with_hint_and_guardrails<R: Read + Seek>(
-        input_reader: R,
-        hint: Option<HeifInputFamily>,
-        guardrails: DecodeGuardrails,
-    ) -> ImageResult<Self> {
-        let decoded =
-            decode_seekable_to_rgba_with_hint_and_guardrails(input_reader, hint, guardrails)
-                .map_err(decode_error_to_image_error)?;
-        Self::from_decoded(decoded)
-    }
-
-    fn storage_color_type(&self) -> ColorType {
-        storage_color_type_from_bit_depth(self.decoded.storage_bit_depth())
-    }
-
-    fn expected_total_bytes(&self) -> ImageResult<usize> {
-        expected_rgba_total_bytes(
-            self.decoded.width,
-            self.decoded.height,
-            self.decoded.storage_bit_depth(),
-        )
-    }
-}
-
-impl ImageDecoder for HeifImageDecoder {
-    fn dimensions(&self) -> (u32, u32) {
-        (self.decoded.width, self.decoded.height)
-    }
-
-    fn color_type(&self) -> ColorType {
-        self.storage_color_type()
-    }
-
-    fn icc_profile(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(self.decoded.icc_profile.clone())
-    }
-
-    fn read_image(self, buf: &mut [u8]) -> ImageResult<()>
-    where
-        Self: Sized,
-    {
-        let expected_total_bytes = self.expected_total_bytes()?;
-        if buf.len() != expected_total_bytes {
-            return Err(ImageError::Parameter(ParameterError::from_kind(
-                ParameterErrorKind::DimensionMismatch,
-            )));
-        }
-
-        match self.decoded.pixels {
-            DecodedRgbaPixels::U8(pixels) => {
-                buf.copy_from_slice(&pixels);
-            }
-            DecodedRgbaPixels::U16(pixels) => {
-                write_rgba16_native_endian_bytes(&pixels, buf);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
-        (*self).read_image(buf)
     }
 }
 
@@ -768,46 +604,6 @@ fn expected_rgba_total_bytes(width: u32, height: u32, storage_bit_depth: u8) -> 
             "decoded RGBA buffer size overflow for {width}x{height} image"
         ))
     })
-}
-
-fn validate_decoded_rgba_image(decoded: &DecodedRgbaImage) -> ImageResult<()> {
-    if decoded.storage_bit_depth() != 8 && decoded.storage_bit_depth() != 16 {
-        return Err(ImageError::Unsupported(
-            UnsupportedError::from_format_and_kind(
-                heif_image_format_hint(),
-                UnsupportedErrorKind::GenericFeature(format!(
-                    "unsupported decoded RGBA storage bit depth {}",
-                    decoded.storage_bit_depth()
-                )),
-            ),
-        ));
-    }
-
-    let expected_samples =
-        expected_rgba_sample_count(decoded.width, decoded.height).ok_or_else(|| {
-            parameter_error(format!(
-                "decoded RGBA sample count overflow for {}x{} image",
-                decoded.width, decoded.height
-            ))
-        })?;
-    let actual_samples = match &decoded.pixels {
-        DecodedRgbaPixels::U8(pixels) => pixels.len(),
-        DecodedRgbaPixels::U16(pixels) => pixels.len(),
-    };
-    if actual_samples != expected_samples {
-        return Err(parameter_error(format!(
-            "decoded RGBA sample count mismatch for {}x{} image: expected {expected_samples}, got {actual_samples}",
-            decoded.width, decoded.height
-        )));
-    }
-
-    Ok(())
-}
-
-fn write_rgba16_native_endian_bytes(samples: &[u16], out: &mut [u8]) {
-    for (sample, chunk) in samples.iter().zip(out.chunks_exact_mut(2)) {
-        chunk.copy_from_slice(&sample.to_ne_bytes());
-    }
 }
 
 fn storage_color_type_from_bit_depth(storage_bit_depth: u8) -> ColorType {

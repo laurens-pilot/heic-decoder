@@ -39,8 +39,6 @@ use std::error::Error;
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-#[cfg(feature = "image-integration")]
-use std::io::Seek;
 use std::io::{BufRead, BufWriter, Read};
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
@@ -9261,17 +9259,6 @@ fn decode_read_to_png_with_hint_and_guardrails<R: Read>(
     )
     .map_err(decode_error_from_source_read_error)?;
     decode_source_to_png_with_hint_and_guardrails(&mut source, hint, output_path, guardrails)
-}
-
-#[cfg(feature = "image-integration")]
-fn decode_seekable_to_rgba_with_hint_and_guardrails<R: Read + Seek>(
-    input_reader: R,
-    hint: Option<HeifInputFamily>,
-    guardrails: DecodeGuardrails,
-) -> Result<DecodedRgbaImage, DecodeError> {
-    let mut source =
-        source::SeekableSource::new(input_reader).map_err(decode_error_from_source_read_error)?;
-    decode_source_to_rgba_with_hint_and_guardrails(&mut source, hint, guardrails)
 }
 
 /// Decode bytes with configurable guardrails into an owned RGBA buffer.

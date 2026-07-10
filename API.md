@@ -297,16 +297,6 @@ which decode does bake into the pixels — `orientation()` reports
 `NoTransforms` (matching `ExifOrientationHint::should_apply_exif_orientation`)
 so callers do not rotate twice; `exif_metadata` still returns the full block.
 
-### 3) Direct adapter usage (optional)
-
-`HeifImageDecoder` constructors:
-
-- `from_bytes[_with_guardrails]`
-- `from_read[_with_guardrails]`
-- `from_bufread[_with_guardrails]`
-- `from_seekable[_with_guardrails]`
-- `from_path[_with_guardrails]`
-
 ## Conversion Helpers (image module)
 
 Under `image-integration`, `DecodedRgbaImage` provides conversion helpers:
