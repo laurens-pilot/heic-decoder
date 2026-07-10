@@ -1856,18 +1856,15 @@ impl DecodedUncompressedChannels {
     }
 }
 
-fn decode_primary_uncompressed_to_channels_internal(
-    input: &[u8],
-    source: &mut Option<&mut dyn RandomAccessSource>,
-) -> Result<DecodedUncompressedChannels, DecodeUncompressedError> {
-    // Provenance: baseline decode flow mirrors libheif uncompressed handling in
-    // libheif/libheif/codecs/uncompressed/unc_codec.cc:
-    // UncompressedImageCodec::{check_header_validity,decode_uncompressed_image}
-    // and decoder dispatch constraints from
-    // libheif/libheif/codecs/uncompressed/unc_decoder.cc:
-    // unc_decoder_factory::{check_common_requirements,get_unc_decoder}.
-    let properties = isobmff::parse_primary_uncompressed_item_properties(input)?;
-
+/// Expand the `uncC` component layout (v1 profile shorthand or v0/v2 `cmpd`
+/// mapping) into per-component decode specs plus the effective sampling and
+/// interleave types.
+///
+/// Shared by the decode path and the image-hook layout probe so component
+/// validation cannot drift between them.
+fn uncompressed_component_layout_from_properties(
+    properties: &isobmff::UncompressedPrimaryItemProperties,
+) -> Result<(Vec<UncompressedComponentDecodeSpec>, u8, u8), DecodeUncompressedError> {
     let mut interleave_type = properties.unc_c.interleave_type;
     let mut sampling_type = properties.unc_c.sampling_type;
     let mut component_specs = Vec::new();
@@ -2007,6 +2004,87 @@ fn decode_primary_uncompressed_to_channels_internal(
         }
     }
 
+    Ok((component_specs, sampling_type, interleave_type))
+}
+
+/// Per-channel presence, bit depth, and component count resolved from the
+/// `uncC` component list.
+struct UncompressedChannelMap {
+    has_channel: [bool; UNCOMPRESSED_CHANNEL_COUNT],
+    channel_bit_depths: [u8; UNCOMPRESSED_CHANNEL_COUNT],
+    channel_component_counts: [u8; UNCOMPRESSED_CHANNEL_COUNT],
+}
+
+/// Fold component decode specs into the per-channel map, enforcing the
+/// duplicate-component rules (only multi-Y luma may repeat, and only at a
+/// single bit depth).
+///
+/// Shared by the decode path and the image-hook layout probe so the two
+/// cannot drift.
+fn resolve_uncompressed_channel_map(
+    component_specs: &[UncompressedComponentDecodeSpec],
+    interleave_type: u8,
+) -> Result<UncompressedChannelMap, DecodeUncompressedError> {
+    let mut has_channel = [false; UNCOMPRESSED_CHANNEL_COUNT];
+    let mut channel_bit_depths = [0_u8; UNCOMPRESSED_CHANNEL_COUNT];
+    let mut channel_component_counts = [0_u8; UNCOMPRESSED_CHANNEL_COUNT];
+    for spec in component_specs {
+        let Some(channel_index) = spec.role.channel_index() else {
+            continue;
+        };
+        if has_channel[channel_index] {
+            let allow_duplicate = interleave_type == UNCOMPRESSED_INTERLEAVE_MULTI_Y
+                && channel_index == UNCOMPRESSED_CHANNEL_LUMA;
+            if allow_duplicate {
+                if channel_bit_depths[channel_index] != spec.bit_depth {
+                    return Err(DecodeUncompressedError::UnsupportedFeature {
+                        detail: format!(
+                            "uncC multi-y interleave requires duplicate luma components to use one bit depth (saw {} and {})",
+                            channel_bit_depths[channel_index], spec.bit_depth
+                        ),
+                    });
+                }
+                channel_component_counts[channel_index] = channel_component_counts[channel_index]
+                    .checked_add(1)
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: "uncompressed multi-y luma component-count overflow".to_string(),
+                    })?;
+                continue;
+            }
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "duplicate component mapping for {} is not supported in this baseline decoder",
+                    uncompressed_channel_name(channel_index)
+                ),
+            });
+        }
+        has_channel[channel_index] = true;
+        channel_bit_depths[channel_index] = spec.bit_depth;
+        channel_component_counts[channel_index] = 1;
+    }
+
+    Ok(UncompressedChannelMap {
+        has_channel,
+        channel_bit_depths,
+        channel_component_counts,
+    })
+}
+
+fn decode_primary_uncompressed_to_channels_internal(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+) -> Result<DecodedUncompressedChannels, DecodeUncompressedError> {
+    // Provenance: baseline decode flow mirrors libheif uncompressed handling in
+    // libheif/libheif/codecs/uncompressed/unc_codec.cc:
+    // UncompressedImageCodec::{check_header_validity,decode_uncompressed_image}
+    // and decoder dispatch constraints from
+    // libheif/libheif/codecs/uncompressed/unc_decoder.cc:
+    // unc_decoder_factory::{check_common_requirements,get_unc_decoder}.
+    let properties = isobmff::parse_primary_uncompressed_item_properties(input)?;
+
+    let (component_specs, sampling_type, interleave_type) =
+        uncompressed_component_layout_from_properties(&properties)?;
+
     let (ycbcr_subsample_x, ycbcr_subsample_y) = match sampling_type {
         UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING => (1_usize, 1_usize),
         UNCOMPRESSED_SAMPLING_422 => (2_usize, 1_usize),
@@ -2123,43 +2201,11 @@ fn decode_primary_uncompressed_to_channels_internal(
         }
     })?;
 
-    let mut has_channel = [false; UNCOMPRESSED_CHANNEL_COUNT];
-    let mut channel_bit_depths = [0_u8; UNCOMPRESSED_CHANNEL_COUNT];
-    let mut channel_component_counts = [0_u8; UNCOMPRESSED_CHANNEL_COUNT];
-    for spec in &component_specs {
-        let Some(channel_index) = spec.role.channel_index() else {
-            continue;
-        };
-        if has_channel[channel_index] {
-            let allow_duplicate = interleave_type == UNCOMPRESSED_INTERLEAVE_MULTI_Y
-                && channel_index == UNCOMPRESSED_CHANNEL_LUMA;
-            if allow_duplicate {
-                if channel_bit_depths[channel_index] != spec.bit_depth {
-                    return Err(DecodeUncompressedError::UnsupportedFeature {
-                        detail: format!(
-                            "uncC multi-y interleave requires duplicate luma components to use one bit depth (saw {} and {})",
-                            channel_bit_depths[channel_index], spec.bit_depth
-                        ),
-                    });
-                }
-                channel_component_counts[channel_index] = channel_component_counts[channel_index]
-                    .checked_add(1)
-                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                        detail: "uncompressed multi-y luma component-count overflow".to_string(),
-                    })?;
-                continue;
-            }
-            return Err(DecodeUncompressedError::InvalidInput {
-                detail: format!(
-                    "duplicate component mapping for {} is not supported in this baseline decoder",
-                    uncompressed_channel_name(channel_index)
-                ),
-            });
-        }
-        has_channel[channel_index] = true;
-        channel_bit_depths[channel_index] = spec.bit_depth;
-        channel_component_counts[channel_index] = 1;
-    }
+    let UncompressedChannelMap {
+        has_channel,
+        channel_bit_depths,
+        channel_component_counts,
+    } = resolve_uncompressed_channel_map(&component_specs, interleave_type)?;
 
     let has_monochrome = has_channel[UNCOMPRESSED_CHANNEL_MONO];
     let has_ycbcr = has_channel[UNCOMPRESSED_CHANNEL_LUMA]
@@ -3447,75 +3493,10 @@ fn select_uncompressed_output_bit_depth(
 fn uncompressed_output_bit_depth_from_properties(
     properties: &isobmff::UncompressedPrimaryItemProperties,
 ) -> Result<u8, DecodeUncompressedError> {
-    if properties.unc_c.full_box.version == 1 {
-        return match properties.unc_c.profile.as_bytes() {
-            bytes if bytes == *b"rgb3" || bytes == *b"rgba" || bytes == *b"abgr" => Ok(8),
-            _ => Err(DecodeUncompressedError::UnsupportedFeature {
-                detail: format!(
-                    "unsupported uncC v1 profile {} for baseline uncompressed decode",
-                    properties.unc_c.profile
-                ),
-            }),
-        };
-    }
-
-    let cmpd = properties
-        .cmpd
-        .as_ref()
-        .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-            detail: format!(
-                "primary item_ID {} is missing required cmpd mapping for uncC version {}",
-                properties.item_id, properties.unc_c.full_box.version
-            ),
-        })?;
-    let mut has_channel = [false; UNCOMPRESSED_CHANNEL_COUNT];
-    let mut channel_bit_depths = [0_u8; UNCOMPRESSED_CHANNEL_COUNT];
-    for component in &properties.unc_c.components {
-        let component_def = cmpd
-            .components
-            .get(usize::from(component.component_index))
-            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                detail: format!(
-                    "uncC component index {} exceeds cmpd component count {}",
-                    component.component_index,
-                    cmpd.components.len()
-                ),
-            })?;
-        if component.component_format != UNCOMPRESSED_COMPONENT_FORMAT_UNSIGNED
-            || component.component_bit_depth == 0
-            || component.component_bit_depth > 16
-        {
-            return Err(DecodeUncompressedError::UnsupportedFeature {
-                detail: format!(
-                    "unsupported uncompressed component format/depth {}/{}",
-                    component.component_format, component.component_bit_depth
-                ),
-            });
-        }
-        let role = uncompressed_role_from_component_type(component_def.component_type)?;
-        let Some(channel_index) = role.channel_index() else {
-            continue;
-        };
-        let bit_depth = component.component_bit_depth as u8;
-        if has_channel[channel_index] {
-            let duplicate_multi_y = properties.unc_c.interleave_type
-                == UNCOMPRESSED_INTERLEAVE_MULTI_Y
-                && channel_index == UNCOMPRESSED_CHANNEL_LUMA
-                && channel_bit_depths[channel_index] == bit_depth;
-            if duplicate_multi_y {
-                continue;
-            }
-            return Err(DecodeUncompressedError::InvalidInput {
-                detail: format!(
-                    "duplicate component mapping for {} is not supported in this baseline decoder",
-                    uncompressed_channel_name(channel_index)
-                ),
-            });
-        }
-        has_channel[channel_index] = true;
-        channel_bit_depths[channel_index] = bit_depth;
-    }
-    select_uncompressed_output_bit_depth(&has_channel, &channel_bit_depths)
+    let (component_specs, _sampling_type, interleave_type) =
+        uncompressed_component_layout_from_properties(properties)?;
+    let channel_map = resolve_uncompressed_channel_map(&component_specs, interleave_type)?;
+    select_uncompressed_output_bit_depth(&channel_map.has_channel, &channel_map.channel_bit_depths)
 }
 
 fn max_sample_for_bit_depth(bit_depth: u8) -> Result<u16, DecodeUncompressedError> {
