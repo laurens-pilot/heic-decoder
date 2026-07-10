@@ -4438,6 +4438,16 @@ fn finish_heic_grid_rgba_decode<T: Copy + Default>(
 ) -> Result<DecodedRgbaImage, DecodeError> {
     let descriptor = &grid_data.descriptor;
     let mut output = vec![T::default(); checked_rgba_sample_count(output_width, output_height)?];
+    if !heic_grid_tiles_cover_descriptor(descriptor, reference) {
+        // Match libheif (and the plane-canvas path): pixels no tile covers
+        // are the converted zero-YUV color, not transparent black. The gap
+        // color is uniform, so filling the (possibly oriented) canvas before
+        // pasting is exact.
+        let gap_pixel = heic_grid_gap_rgba_pixel(reference, convert_tile)?;
+        for pixel in output.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&gap_pixel);
+        }
+    }
     paste_heic_grid_tiles_to_rgba(
         grid_data,
         first_tile,
@@ -4536,6 +4546,59 @@ impl HeicGridTileReference {
                 .unwrap_or(first_tile.ycbcr_matrix),
         }
     }
+}
+
+/// True when the uniform tile lattice covers every descriptor pixel, so the
+/// paste loops leave no gap pixels behind.
+fn heic_grid_tiles_cover_descriptor(
+    descriptor: &isobmff::HeicGridDescriptor,
+    reference: &HeicGridTileReference,
+) -> bool {
+    u64::from(descriptor.columns) * u64::from(reference.tile_width)
+        >= u64::from(descriptor.output_width)
+        && u64::from(descriptor.rows) * u64::from(reference.tile_height)
+            >= u64::from(descriptor.output_height)
+}
+
+/// RGBA pixel for descriptor pixels no tile covers. libheif composes grids on
+/// a zero-filled YUV canvas and converts the whole canvas afterwards, so gap
+/// pixels come out as the converted all-zero YUV sample (opaque, green-tinted
+/// for limited-range color) rather than transparent black. Convert a single
+/// zero sample through the same tile conversion to match that exactly.
+fn heic_grid_gap_rgba_pixel<T: Copy>(
+    reference: &HeicGridTileReference,
+    convert_tile: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
+) -> Result<[T; 4], DecodeHeicError> {
+    let zero_plane = HeicPlane {
+        width: 1,
+        height: 1,
+        samples: vec![0],
+    };
+    let chroma_plane = if reference.layout == HeicPixelLayout::Yuv400 {
+        None
+    } else {
+        Some(zero_plane.clone())
+    };
+    let zero_image = DecodedHeicImage {
+        width: 1,
+        height: 1,
+        bit_depth_luma: reference.bit_depth_luma,
+        bit_depth_chroma: reference.bit_depth_chroma,
+        layout: reference.layout,
+        ycbcr_range: reference.conversion_ycbcr_range,
+        ycbcr_matrix: reference.conversion_ycbcr_matrix,
+        y_plane: zero_plane.clone(),
+        u_plane: chroma_plane.clone(),
+        v_plane: chroma_plane,
+    };
+    let mut pixel = Vec::new();
+    convert_tile(&zero_image, &mut pixel)?;
+    <[T; 4]>::try_from(pixel.as_slice()).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+        detail: format!(
+            "grid gap pixel conversion produced {} samples, expected 4",
+            pixel.len()
+        ),
+    })
 }
 
 fn validate_decoded_heic_grid_tile_reference(
@@ -7674,10 +7737,24 @@ fn decode_primary_heic_grid_to_rgba_output<T: Copy + Default, O: RgbaSampleOutpu
         ));
     }
 
+    let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
     // Caller-provided ImageDecoder buffers are not guaranteed to be
-    // pre-cleared. Preserve the owned grid path's zero-filled gaps when
-    // clipped tiles do not cover the descriptor output exactly.
-    out.fill(T::default());
+    // pre-cleared. Match the owned grid path (and libheif's zero-filled YUV
+    // canvas) for descriptor pixels clipped tiles do not cover: the opaque
+    // converted-zero-YUV color, not transparent black.
+    if heic_grid_tiles_cover_descriptor(&grid_data.descriptor, &reference) {
+        out.fill(T::default());
+    } else {
+        let gap_pixel = heic_grid_gap_rgba_pixel(&reference, convert_tile)?;
+        let mut sample_index = 0;
+        while sample_index < expected {
+            out.write_sample(sample_index, gap_pixel[0]);
+            out.write_sample(sample_index + 1, gap_pixel[1]);
+            out.write_sample(sample_index + 2, gap_pixel[2]);
+            out.write_sample(sample_index + 3, gap_pixel[3]);
+            sample_index += 4;
+        }
+    }
     if let Some(alpha) = auxiliary_alpha {
         validate_auxiliary_alpha_plane(
             alpha,
@@ -7700,7 +7777,7 @@ fn decode_primary_heic_grid_to_rgba_output<T: Copy + Default, O: RgbaSampleOutpu
                     detail: "transformed grid alpha width cannot be represented".to_string(),
                 }
             })?;
-        // The owned path applies the auxiliary plane to the whole zero-filled
+        // The owned path applies the auxiliary plane to the whole gap-filled
         // grid canvas, including any descriptor pixels not covered by tiles.
         // Seed alpha for every transformed source pixel before tile RGB is
         // pasted so the direct path preserves those gap pixels exactly.
@@ -7721,7 +7798,6 @@ fn decode_primary_heic_grid_to_rgba_output<T: Copy + Default, O: RgbaSampleOutpu
             }
         }
     }
-    let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
     paste_heic_grid_tiles_to_transformed_rgba_slice(
         grid_data,
         first_tile,
@@ -12312,6 +12388,81 @@ mod tests {
         assert_eq!(width, orientation_transform.destination_width);
         assert_eq!(height, orientation_transform.destination_height);
         assert_eq!(direct, transformed);
+    }
+
+    #[test]
+    fn grid_gap_pixel_matches_plane_canvas_conversion() {
+        // libheif composes grids on a zero-filled YUV canvas and converts the
+        // whole canvas, so tile-uncovered pixels must decode to the converted
+        // all-zero sample (opaque), never transparent black.
+        let reference = super::HeicGridTileReference {
+            tile_width: 3,
+            tile_height: 2,
+            layout: super::HeicPixelLayout::Yuv420,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            ycbcr_range: super::YCbCrRange::Limited,
+            ycbcr_matrix: super::YCbCrMatrixCoefficients::default(),
+            conversion_ycbcr_range: super::YCbCrRange::Limited,
+            conversion_ycbcr_matrix: super::YCbCrMatrixCoefficients::default(),
+        };
+        let gap_pixel =
+            super::heic_grid_gap_rgba_pixel(&reference, super::convert_heic_to_rgba8_into)
+                .expect("gap pixel conversion should succeed");
+
+        // Reference: a zero-filled 2x2 plane canvas converted whole, exactly
+        // what the plane-canvas grid path produces for gap pixels.
+        let zero_canvas = super::DecodedHeicImage {
+            width: 2,
+            height: 2,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            layout: super::HeicPixelLayout::Yuv420,
+            ycbcr_range: super::YCbCrRange::Limited,
+            ycbcr_matrix: super::YCbCrMatrixCoefficients::default(),
+            y_plane: super::HeicPlane {
+                width: 2,
+                height: 2,
+                samples: vec![0; 4],
+            },
+            u_plane: Some(super::HeicPlane {
+                width: 1,
+                height: 1,
+                samples: vec![0],
+            }),
+            v_plane: Some(super::HeicPlane {
+                width: 1,
+                height: 1,
+                samples: vec![0],
+            }),
+        };
+        let converted =
+            super::convert_heic_to_rgba8(&zero_canvas).expect("zero canvas should convert");
+        assert_eq!(gap_pixel.as_slice(), &converted[..4]);
+        // Opaque, unlike the transparent black a zero-filled RGBA buffer
+        // would produce.
+        assert_eq!(gap_pixel[3], u8::MAX);
+
+        let descriptor = super::isobmff::HeicGridDescriptor {
+            version: 0,
+            rows: 1,
+            columns: 3,
+            output_width: 10,
+            output_height: 2,
+        };
+        // 3x3 tiles cover 9 of 10 columns: gap fill required.
+        assert!(!super::heic_grid_tiles_cover_descriptor(
+            &descriptor,
+            &reference
+        ));
+        let covering = super::HeicGridTileReference {
+            tile_width: 4,
+            ..reference
+        };
+        assert!(super::heic_grid_tiles_cover_descriptor(
+            &descriptor,
+            &covering
+        ));
     }
 
     #[test]
