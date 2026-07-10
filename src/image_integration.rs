@@ -11,10 +11,10 @@ use crate::{
     DecodeError, DecodeGuardrailError, DecodeGuardrails, DecodedRgbaImage, DecodedRgbaLayout,
     DecodedRgbaPixels, HeifInputFamily, decode_bufread_to_rgba_with_guardrails,
     decode_bytes_to_rgba_layout_with_hint_and_guardrails, decode_bytes_to_rgba_with_guardrails,
-    decode_bytes_to_rgba_with_hint_and_guardrails,
     decode_bytes_to_rgba8_slice_with_hint_and_guardrails,
-    decode_bytes_to_rgba16_slice_with_hint_and_guardrails, decode_path_to_rgba_with_guardrails,
-    decode_read_to_rgba_with_guardrails, decode_seekable_to_rgba_with_hint_and_guardrails,
+    decode_bytes_to_rgba16_native_endian_bytes_with_hint_and_guardrails,
+    decode_path_to_rgba_with_guardrails, decode_read_to_rgba_with_guardrails,
+    decode_seekable_to_rgba_with_hint_and_guardrails,
 };
 use image::error::{
     DecodingError, ImageFormatHint, ParameterError, ParameterErrorKind, UnsupportedError,
@@ -314,28 +314,13 @@ impl ImageDecoder for LazyHeifImageDecoder {
                 buf,
             )
             .map_err(decode_error_to_image_error),
-            16 => {
-                if let Some(samples) = native_endian_bytes_as_u16_slice_mut(buf) {
-                    decode_bytes_to_rgba16_slice_with_hint_and_guardrails(
-                        &self.input,
-                        self.hint,
-                        self.guardrails,
-                        samples,
-                    )
-                    .map_err(decode_error_to_image_error)
-                } else {
-                    // Sole sanctioned decode-then-copy fallback on the lazy
-                    // path: the caller's byte buffer is not u16-aligned, which
-                    // is outside our control and vanishingly rare in practice.
-                    let decoded = decode_bytes_to_rgba_with_hint_and_guardrails(
-                        &self.input,
-                        self.hint,
-                        self.guardrails,
-                    )
-                    .map_err(decode_error_to_image_error)?;
-                    HeifImageDecoder::from_decoded(decoded)?.read_image(buf)
-                }
-            }
+            16 => decode_bytes_to_rgba16_native_endian_bytes_with_hint_and_guardrails(
+                &self.input,
+                self.hint,
+                self.guardrails,
+                buf,
+            )
+            .map_err(decode_error_to_image_error),
             other => {
                 unreachable!("validated storage bit depth must be 8 or 16, got {other}")
             }
@@ -347,46 +332,34 @@ impl ImageDecoder for LazyHeifImageDecoder {
     }
 }
 
-/// Build the hook decoder: lazy when the layout probe supports the input,
-/// eager otherwise.
+/// Build a hook decoder that probes metadata up front and defers pixel decode
+/// until `read_image` supplies the destination buffer.
 ///
-/// Invariant pair the hook relies on:
-/// - Coverage: whatever the layout probe rejects as `Unsupported` (today:
-///   uncompressed HEIF and AVIF) MUST decode through the eager fallback
-///   below, so hooks decode everything the owned decode APIs can.
-/// - Memory: once the probe accepts an input, the lazy decoder's slice paths
-///   either decode straight into the caller's buffer or fail loudly — they
-///   never silently fall back to a full decode plus copy (enforced by
-///   `reject_uncompressed_heif_on_lazy_adapter_paths` and the slice
-///   dispatchers' AVIF rejection in `lib.rs`). A probe/slice mismatch shows
-///   up as hard decode failures in the verify harness's per-file hook check.
+/// Memory invariant: every accepted format writes into the caller's buffer;
+/// there is no eager owned-RGBA fallback. Codec-native planes and bounded grid
+/// tile scratch buffers may still be allocated during decode.
 fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
     input_reader: R,
     hint: Option<HeifInputFamily>,
     guardrails: DecodeGuardrails,
 ) -> ImageResult<Box<dyn ImageDecoder>> {
     let input = read_seekable_input_to_vec(input_reader, &guardrails)?;
-    match decode_bytes_to_rgba_layout_with_hint_and_guardrails(&input, hint, guardrails.clone()) {
-        Ok(layout) => Ok(Box::new(LazyHeifImageDecoder::from_encoded_input(
-            input, hint, guardrails, layout,
-        ))),
-        Err(DecodeError::Unsupported(_)) => {
-            let decoded = decode_bytes_to_rgba_with_hint_and_guardrails(&input, hint, guardrails)
-                .map_err(decode_error_to_image_error)?;
-            Ok(Box::new(HeifImageDecoder::from_decoded(decoded)?))
-        }
-        Err(err) => Err(decode_error_to_image_error(err)),
-    }
+    let layout =
+        decode_bytes_to_rgba_layout_with_hint_and_guardrails(&input, hint, guardrails.clone())
+            .map_err(decode_error_to_image_error)?;
+    Ok(Box::new(LazyHeifImageDecoder::from_encoded_input(
+        input, hint, guardrails, layout,
+    )))
 }
 
 /// Read the whole encoded input into memory.
 ///
 /// This is a deliberate trade: the lazy decoder needs the full input as a
 /// byte slice so `read_image` can decode directly into the caller's buffer
-/// (dropping the owned RGBA copy the eager path carries, which dominates
-/// peak memory). The cost is that the encoded input — usually far smaller
-/// than the decoded RGBA — is held in memory for the decoder's lifetime,
-/// bounded only by `guardrails.max_input_bytes`.
+/// (without an additional full-frame owned RGBA allocation, which would
+/// dominate peak memory). The cost is that the encoded input — usually far
+/// smaller than the decoded RGBA — is held in memory for the decoder's
+/// lifetime, bounded only by `guardrails.max_input_bytes`.
 fn read_seekable_input_to_vec<R: Read + Seek>(
     mut input_reader: R,
     guardrails: &DecodeGuardrails,
@@ -434,21 +407,6 @@ fn read_seekable_input_to_vec<R: Read + Seek>(
     Ok(input)
 }
 
-fn native_endian_bytes_as_u16_slice_mut(buf: &mut [u8]) -> Option<&mut [u16]> {
-    if !buf.len().is_multiple_of(std::mem::size_of::<u16>()) {
-        return None;
-    }
-
-    // SAFETY: `u16` accepts every bit pattern. We only return the middle slice
-    // when the whole byte buffer was properly aligned and exactly covered.
-    let (prefix, samples, suffix) = unsafe { buf.align_to_mut::<u16>() };
-    if prefix.is_empty() && suffix.is_empty() {
-        Some(samples)
-    } else {
-        None
-    }
-}
-
 /// Result of attempting to install `image` crate decoder hooks for this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageHookRegistration {
@@ -479,8 +437,10 @@ impl ImageHookRegistration {
 ///
 /// Memory: hook decodes buffer the entire encoded input in memory before
 /// decoding (in exchange, pixels decode straight into the caller's buffer
-/// without an intermediate RGBA copy). The default guardrails leave that
-/// input buffer unbounded; production callers should prefer
+/// without an additional full-frame RGBA allocation). Codec-native planes
+/// and a single grid-tile scratch buffer may still be allocated. The default
+/// guardrails leave the encoded input buffer unbounded; production callers
+/// should prefer
 /// [`register_image_decoder_hooks_with_guardrails`] with
 /// [`DecodeGuardrails::max_input_bytes`] set.
 pub fn register_image_decoder_hooks() -> ImageHookRegistration {
@@ -860,12 +820,11 @@ mod tests {
     };
     use std::io::Cursor;
 
-    /// Locks the hook coverage half of the lazy-adapter contract: inputs the
-    /// layout probe rejects as unsupported (here: uncompressed HEIF) must
-    /// still decode through the eager fallback, pixel-identical to the
-    /// direct decode APIs.
+    /// Locks the uncompressed half of the lazy-adapter contract: layout
+    /// probing and caller-buffer decoding must stay pixel-identical to the
+    /// direct owned API.
     #[test]
-    fn hook_decoder_falls_back_to_eager_for_uncompressed_heif() {
+    fn hook_decoder_decodes_uncompressed_heif_lazily() {
         let (file, expected_rgba) = crate::isobmff::test_support::minimal_uncompressed_rgb3_heif();
 
         let decoder = decoder_from_seekable_with_hint_and_guardrails(
@@ -873,14 +832,14 @@ mod tests {
             Some(HeifInputFamily::Heif),
             DecodeGuardrails::default(),
         )
-        .expect("hook construction must fall back to the eager decoder");
+        .expect("hook construction must accept the lazy uncompressed decoder");
         assert_eq!(decoder.dimensions(), (2, 1));
         assert_eq!(decoder.color_type(), ColorType::Rgba8);
 
         let mut pixels = vec![0_u8; expected_rgba.len()];
         decoder
             .read_image_boxed(&mut pixels)
-            .expect("eager fallback decode should succeed");
+            .expect("lazy uncompressed decode should succeed");
         assert_eq!(pixels, expected_rgba);
     }
 }
