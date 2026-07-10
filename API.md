@@ -289,8 +289,12 @@ let img = if let Some(orientation) = hint.orientation_to_apply() {
 The registered hook decoder also exposes the primary item's EXIF block through
 the standard `ImageDecoder::exif_metadata`/`ImageDecoder::orientation` methods,
 so generic `image` code (`decoder.orientation()` +
-`DynamicImage::apply_orientation`) works without crate-specific helpers. Pixels
-stay unrotated either way; applying orientation remains the caller's choice.
+`DynamicImage::apply_orientation`) works without crate-specific helpers. EXIF
+orientation stays unapplied in the pixels; applying it remains the caller's
+choice. When the primary item carries `irot`/`imir` container transforms —
+which decode does bake into the pixels — `orientation()` reports
+`NoTransforms` (matching `ExifOrientationHint::should_apply_exif_orientation`)
+so callers do not rotate twice; `exif_metadata` still returns the full block.
 
 ### 3) Direct adapter usage (optional)
 

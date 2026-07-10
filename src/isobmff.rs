@@ -7295,6 +7295,23 @@ pub(crate) mod test_support {
     pub(crate) fn minimal_uncompressed_rgb3_heif_with_exif_orientation(
         orientation: u16,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        minimal_uncompressed_rgb3_heif_with_exif_orientation_and_transforms(orientation, &[])
+    }
+
+    pub(crate) fn irot_box(rotation_ccw_quarter_turns: u8) -> Vec<u8> {
+        plain_box(b"irot", &[rotation_ccw_quarter_turns & 0x03])
+    }
+
+    /// [`minimal_uncompressed_rgb3_heif_with_exif_orientation`] with extra
+    /// transform property boxes (`irot`/`imir`/`clap`) associated with the
+    /// primary item after `ispe` and `uncC`.
+    ///
+    /// The returned RGBA pixels are the untransformed samples; callers that
+    /// pass transforms derive their own expected output.
+    pub(crate) fn minimal_uncompressed_rgb3_heif_with_exif_orientation_and_transforms(
+        orientation: u16,
+        transform_properties: &[Vec<u8>],
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let pixels_rgb: [u8; 6] = [10, 20, 30, 200, 150, 100];
         let expected_rgba: Vec<u8> = vec![10, 20, 30, 255, 200, 150, 100, 255];
 
@@ -7316,6 +7333,10 @@ pub(crate) mod test_support {
         exif_payload.extend_from_slice(&0_u32.to_be_bytes());
         exif_payload.extend_from_slice(&tiff);
 
+        let mut properties = vec![ispe_box(2, 1), uncc_v1_box(b"rgb3")];
+        properties.extend_from_slice(transform_properties);
+        let association_indices: Vec<u8> = (1..=u8::try_from(properties.len()).unwrap()).collect();
+
         let ftyp = ftyp_box(b"mif1");
         let meta_with_data_offsets = |pixel_offset: u32, exif_offset: u32| {
             meta_file(&[
@@ -7326,7 +7347,7 @@ pub(crate) mod test_support {
                 ]),
                 iinf_box(&[infe_box(1, b"unci"), infe_box(2, b"Exif")]),
                 iref_reference_box(b"cdsc", 2, &[1]),
-                iprp_box(&[ispe_box(2, 1), uncc_v1_box(b"rgb3")], &[(1, &[1, 2])]),
+                iprp_box(&properties, &[(1, &association_indices)]),
             ])
         };
         // The iloc extent offsets are file-absolute and all iloc fields are

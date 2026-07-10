@@ -21,6 +21,7 @@ use image::error::{
     UnsupportedErrorKind,
 };
 use image::hooks;
+use image::metadata::Orientation;
 use image::{ColorType, DynamicImage, ImageBuffer, ImageDecoder, ImageError, ImageResult, Rgba};
 use std::error::Error;
 use std::ffi::OsString;
@@ -302,6 +303,20 @@ impl ImageDecoder for LazyHeifImageDecoder {
     // `Orientation::NoTransforms` for EXIF-only-rotated files.
     fn exif_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
         Ok(crate::primary_exif_tiff_payload(&self.input))
+    }
+
+    // Container transforms (`irot`/`imir`) are baked into the decoded pixels,
+    // so reporting the EXIF orientation on top would make generic
+    // `orientation()` + `apply_orientation` callers double-rotate. Mirror the
+    // gate in `ExifOrientationHint::should_apply_exif_orientation`.
+    fn orientation(&mut self) -> ImageResult<Orientation> {
+        if crate::primary_item_has_orientation_transform(&self.input) {
+            return Ok(Orientation::NoTransforms);
+        }
+        Ok(self
+            .exif_metadata()?
+            .and_then(|chunk| Orientation::from_exif_chunk(&chunk))
+            .unwrap_or(Orientation::NoTransforms))
     }
 
     fn read_image(self, buf: &mut [u8]) -> ImageResult<()>
@@ -904,6 +919,55 @@ mod tests {
             .read_image_boxed(&mut pixels)
             .expect("lazy uncompressed decode should succeed");
         assert_eq!(pixels, expected_rgba);
+    }
+
+    /// When the primary item carries `irot`/`imir`, decode bakes that
+    /// transform into the pixels, so `orientation()` must report
+    /// `NoTransforms` — otherwise generic `orientation()` +
+    /// `apply_orientation` callers double-rotate. Mirrors
+    /// `ExifOrientationHint::should_apply_exif_orientation`.
+    #[test]
+    fn hook_decoder_suppresses_exif_orientation_when_transforms_bake_rotation() {
+        let (file, unrotated_rgba, expected_tiff) = crate::isobmff::test_support::
+            minimal_uncompressed_rgb3_heif_with_exif_orientation_and_transforms(
+                6,
+                &[crate::isobmff::test_support::irot_box(1)],
+            );
+
+        let mut decoder = decoder_from_seekable_with_hint_and_guardrails(
+            Cursor::new(file),
+            Some(HeifInputFamily::Heif),
+            DecodeGuardrails::default(),
+        )
+        .expect("hook construction should succeed");
+
+        // The EXIF block itself stays exposed (camera metadata and friends);
+        // only the derived orientation is suppressed.
+        assert_eq!(
+            decoder
+                .exif_metadata()
+                .expect("exif metadata read should succeed"),
+            Some(expected_tiff)
+        );
+        assert_eq!(
+            decoder
+                .orientation()
+                .expect("orientation read should succeed"),
+            image::metadata::Orientation::NoTransforms
+        );
+
+        // The irot is baked into the pixels: 2x1 rotated 90 degrees CCW.
+        assert_eq!(decoder.dimensions(), (1, 2));
+        let mut pixels = vec![0_u8; unrotated_rgba.len()];
+        decoder
+            .read_image_boxed(&mut pixels)
+            .expect("lazy uncompressed decode should succeed");
+        let expected_rotated: Vec<u8> = unrotated_rgba[4..8]
+            .iter()
+            .chain(&unrotated_rgba[0..4])
+            .copied()
+            .collect();
+        assert_eq!(pixels, expected_rotated);
     }
 
     #[test]
