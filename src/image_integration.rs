@@ -8,8 +8,8 @@
 //! See `API.md` in the crate root for end-to-end examples.
 
 use crate::{
-    DecodeError, DecodeGuardrailError, DecodeGuardrails, DecodedRgbaImage, DecodedRgbaLayout,
-    DecodedRgbaPixels, HeifInputFamily, decode_bufread_to_rgba_with_guardrails,
+    DecodeError, DecodeGuardrails, DecodedRgbaImage, DecodedRgbaLayout, DecodedRgbaPixels,
+    HeifInputFamily, decode_bufread_to_rgba_with_guardrails,
     decode_bytes_to_rgba_layout_with_hint_and_guardrails, decode_bytes_to_rgba_with_guardrails,
     decode_bytes_to_rgba8_slice_with_hint_and_guardrails,
     decode_bytes_to_rgba16_native_endian_bytes_with_hint_and_guardrails,
@@ -360,6 +360,14 @@ fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
 /// dominate peak memory). The cost is that the encoded input — usually far
 /// smaller than the decoded RGBA — is held in memory for the decoder's
 /// lifetime, bounded only by `guardrails.max_input_bytes`.
+/// Pre-allocation ceiling for the seek-reported input length. The reported
+/// length is untrusted until the bytes are actually read: a lying or corrupt
+/// reader could otherwise trigger a multi-gigabyte allocation (or a
+/// capacity-overflow panic) before a single byte arrives. `read_to_end` still
+/// grows the buffer past this for genuinely larger, guardrail-permitted
+/// inputs.
+const MAX_INPUT_PREALLOCATION_BYTES: u64 = 64 * 1024 * 1024;
+
 fn read_seekable_input_to_vec<R: Read + Seek>(
     mut input_reader: R,
     guardrails: &DecodeGuardrails,
@@ -367,24 +375,17 @@ fn read_seekable_input_to_vec<R: Read + Seek>(
     let input_len = input_reader
         .seek(SeekFrom::End(0))
         .map_err(ImageError::IoError)?;
-    if let Some(max_input_bytes) = guardrails.max_input_bytes
-        && input_len > max_input_bytes
-    {
-        return Err(decode_error_to_image_error(
-            DecodeGuardrailError::InputTooLarge {
-                actual_bytes: input_len,
-                max_input_bytes,
-            }
-            .into(),
-        ));
-    }
+    guardrails
+        .enforce_input_bytes(input_len)
+        .map_err(decode_error_to_image_error)?;
 
     input_reader
         .seek(SeekFrom::Start(0))
         .map_err(ImageError::IoError)?;
-    let capacity = usize::try_from(input_len).map_err(|_| {
+    let prealloc_len = input_len.min(MAX_INPUT_PREALLOCATION_BYTES);
+    let capacity = usize::try_from(prealloc_len).map_err(|_| {
         parameter_error(format!(
-            "input size {input_len} bytes does not fit in memory on this platform"
+            "input size {prealloc_len} bytes does not fit in memory on this platform"
         ))
     })?;
     let mut input = Vec::with_capacity(capacity);
@@ -392,17 +393,11 @@ fn read_seekable_input_to_vec<R: Read + Seek>(
         .read_to_end(&mut input)
         .map_err(ImageError::IoError)?;
 
-    if let Some(max_input_bytes) = guardrails.max_input_bytes
-        && input.len() as u64 > max_input_bytes
-    {
-        return Err(decode_error_to_image_error(
-            DecodeGuardrailError::InputTooLarge {
-                actual_bytes: input.len() as u64,
-                max_input_bytes,
-            }
-            .into(),
-        ));
-    }
+    // Re-check the actual byte count: a reader may yield more bytes than its
+    // seek-reported length claimed.
+    guardrails
+        .enforce_input_bytes(input.len() as u64)
+        .map_err(decode_error_to_image_error)?;
 
     Ok(input)
 }
@@ -840,6 +835,48 @@ mod tests {
         decoder
             .read_image_boxed(&mut pixels)
             .expect("lazy uncompressed decode should succeed");
+        assert_eq!(pixels, expected_rgba);
+    }
+
+    /// A reader whose seek-reported length lies wildly. The hook must not
+    /// size an allocation from the untrusted length (that would panic or
+    /// abort before a single byte is read) and must still decode the bytes
+    /// the reader actually yields.
+    struct LyingLengthReader(Cursor<Vec<u8>>);
+
+    impl std::io::Read for LyingLengthReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl std::io::Seek for LyingLengthReader {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            match pos {
+                std::io::SeekFrom::End(0) => {
+                    self.0.seek(std::io::SeekFrom::End(0))?;
+                    Ok(u64::MAX)
+                }
+                other => self.0.seek(other),
+            }
+        }
+    }
+
+    #[test]
+    fn hook_decoder_survives_lying_seek_length() {
+        let (file, expected_rgba) = crate::isobmff::test_support::minimal_uncompressed_rgb3_heif();
+
+        let decoder = decoder_from_seekable_with_hint_and_guardrails(
+            LyingLengthReader(Cursor::new(file)),
+            Some(HeifInputFamily::Heif),
+            DecodeGuardrails::default(),
+        )
+        .expect("a lying seek length must not fail hook construction");
+
+        let mut pixels = vec![0_u8; expected_rgba.len()];
+        decoder
+            .read_image_boxed(&mut pixels)
+            .expect("decode should use the bytes the reader actually yields");
         assert_eq!(pixels, expected_rgba);
     }
 }
