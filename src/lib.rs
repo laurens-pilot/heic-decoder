@@ -5811,55 +5811,29 @@ fn crop_heic_by_clean_aperture(
     decoded: DecodedHeicImage,
     clean_aperture: isobmff::ImageCleanApertureProperty,
 ) -> Result<DecodedHeicImage, DecodeHeicError> {
-    if decoded.width == 0 || decoded.height == 0 {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
+    // Bounds come from the same helper as the RGBA transform path so the two
+    // crop semantics cannot drift; only the error type differs here.
+    let crop = clean_aperture_crop_bounds(decoded.width, decoded.height, clean_aperture).map_err(
+        |source| DecodeHeicError::InvalidDecodedFrame {
             detail: format!(
-                "grid tile clean-aperture input geometry must be non-zero, got {}x{}",
+                "grid tile clean-aperture crop is invalid for {}x{}: {source}",
                 decoded.width, decoded.height
             ),
-        });
-    }
-
-    let mut left = clap_left_rounded(clean_aperture, decoded.width);
-    let mut right = clap_right_rounded(clean_aperture, decoded.width);
-    let mut top = clap_top_rounded(clean_aperture, decoded.height);
-    let mut bottom = clap_bottom_rounded(clean_aperture, decoded.height);
-
-    left = left.max(0);
-    top = top.max(0);
-    let max_x = i128::from(decoded.width) - 1;
-    let max_y = i128::from(decoded.height) - 1;
-    right = right.min(max_x);
-    bottom = bottom.min(max_y);
-
-    if left > right || top > bottom {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "grid tile clean-aperture crop is empty after clamp (left={left}, right={right}, top={top}, bottom={bottom}, tile={}x{})",
-                decoded.width, decoded.height
-            ),
-        });
-    }
-
-    let crop_width =
-        u32::try_from(right - left + 1).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "grid tile clean-aperture width is out of range: {}",
-                right - left + 1
-            ),
-        })?;
-    let crop_height =
-        u32::try_from(bottom - top + 1).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "grid tile clean-aperture height is out of range: {}",
-                bottom - top + 1
-            ),
-        })?;
-    let crop_left = u32::try_from(left).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-        detail: format!("grid tile clean-aperture left bound is out of range: {left}"),
+        },
+    )?;
+    let crop_width = crop.width;
+    let crop_height = crop.height;
+    let crop_left = u32::try_from(crop.left).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+        detail: format!(
+            "grid tile clean-aperture left bound is out of range: {}",
+            crop.left
+        ),
     })?;
-    let crop_top = u32::try_from(top).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-        detail: format!("grid tile clean-aperture top bound is out of range: {top}"),
+    let crop_top = u32::try_from(crop.top).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+        detail: format!(
+            "grid tile clean-aperture top bound is out of range: {}",
+            crop.top
+        ),
     })?;
 
     if crop_left == 0
