@@ -4535,6 +4535,23 @@ impl HeicGridTileReference {
                 .unwrap_or(first_tile.ycbcr_matrix),
         }
     }
+
+    /// Reference assembled from the plane-canvas grid output: tiles must
+    /// match the canvas metadata exactly, and no conversion-time colr
+    /// override applies at paste time.
+    fn from_output_canvas(output: &DecodedHeicImage, tile_width: u32, tile_height: u32) -> Self {
+        Self {
+            tile_width,
+            tile_height,
+            layout: output.layout,
+            bit_depth_luma: output.bit_depth_luma,
+            bit_depth_chroma: output.bit_depth_chroma,
+            ycbcr_range: output.ycbcr_range,
+            ycbcr_matrix: output.ycbcr_matrix,
+            conversion_ycbcr_range: output.ycbcr_range,
+            conversion_ycbcr_matrix: output.ycbcr_matrix,
+        }
+    }
 }
 
 /// True when the uniform tile lattice covers every descriptor pixel, so the
@@ -4628,16 +4645,19 @@ fn validate_decoded_heic_grid_tile_reference(
     Ok(())
 }
 
-fn paste_heic_grid_tiles_to_rgba<T: Copy>(
+/// Drive the shared per-tile grid loop: decode each tile (reusing the
+/// pre-decoded first tile), validate it against the reference, apply the
+/// grid-level colr conversion overrides, convert it to RGBA, and compute the
+/// aligned tile origin — then hand it to `paste`. Shared by the owned and
+/// caller-buffer grid paths so their per-tile semantics cannot drift.
+fn for_each_heic_grid_tile_rgba<T: Copy>(
     grid_data: &isobmff::HeicGridPrimaryItemData,
     first_tile: DecodedHeicImage,
-    output: &mut [T],
     reference: &HeicGridTileReference,
-    orientation_transform: Option<&RgbaOrientationTransform>,
     convert_tile: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
+    mut paste: impl FnMut(&DecodedHeicImage, &[T], u32, u32) -> Result<(), DecodeError>,
 ) -> Result<(), DecodeError> {
-    let descriptor = &grid_data.descriptor;
-    let columns = usize::from(descriptor.columns);
+    let columns = usize::from(grid_data.descriptor.columns);
     let mut first_tile = Some(first_tile);
     let mut tile_pixels = Vec::new();
     for tile_index in 0..grid_data.tiles.len() {
@@ -4659,33 +4679,54 @@ fn paste_heic_grid_tiles_to_rgba<T: Copy>(
         let (x_origin, y_origin) =
             heic_grid_tile_origin(reference.tile_width, reference.tile_height, row, column)?;
         validate_heic_grid_tile_origin_alignment(reference.layout, x_origin, y_origin)?;
-        if let Some(orientation_transform) = orientation_transform {
-            paste_transformed_rgba_tile_with_clip(
-                &tile_pixels,
-                tile.width,
-                tile.height,
-                output,
-                orientation_transform,
-                x_origin,
-                y_origin,
-                "grid tile RGBA",
-            )?;
-        } else {
-            paste_rgba_tile_with_clip(
-                &tile_pixels,
-                tile.width,
-                tile.height,
-                output,
-                descriptor.output_width,
-                descriptor.output_height,
-                x_origin,
-                y_origin,
-                "grid tile RGBA",
-            )?;
-        }
+        paste(&tile, &tile_pixels, x_origin, y_origin)?;
     }
 
     Ok(())
+}
+
+fn paste_heic_grid_tiles_to_rgba<T: Copy>(
+    grid_data: &isobmff::HeicGridPrimaryItemData,
+    first_tile: DecodedHeicImage,
+    output: &mut [T],
+    reference: &HeicGridTileReference,
+    orientation_transform: Option<&RgbaOrientationTransform>,
+    convert_tile: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
+) -> Result<(), DecodeError> {
+    let descriptor = &grid_data.descriptor;
+    for_each_heic_grid_tile_rgba(
+        grid_data,
+        first_tile,
+        reference,
+        convert_tile,
+        |tile, tile_pixels, x_origin, y_origin| {
+            if let Some(orientation_transform) = orientation_transform {
+                paste_transformed_rgba_tile_with_clip(
+                    tile_pixels,
+                    tile.width,
+                    tile.height,
+                    output,
+                    orientation_transform,
+                    x_origin,
+                    y_origin,
+                    "grid tile RGBA",
+                )
+            } else {
+                paste_rgba_tile_with_clip(
+                    tile_pixels,
+                    tile.width,
+                    tile.height,
+                    output,
+                    descriptor.output_width,
+                    descriptor.output_height,
+                    x_origin,
+                    y_origin,
+                    "grid tile RGBA",
+                )
+                .map_err(DecodeError::from)
+            }
+        },
+    )
 }
 
 fn heic_grid_tile_origin(
@@ -5614,65 +5655,11 @@ fn paste_decoded_heic_grid_tile(
     column: usize,
     tile_index: usize,
 ) -> Result<(), DecodeHeicError> {
-    if tile.width != tile_width || tile.height != tile_height {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "grid tiles have mixed dimensions: expected {tile_width}x{tile_height}, got {}x{} at index {tile_index}",
-                tile.width, tile.height
-            ),
-        });
-    }
-    if tile.layout != output.layout {
-        return Err(DecodeHeicError::DecodedLayoutMismatch {
-            expected: output.layout,
-            actual: tile.layout,
-        });
-    }
-    if tile.bit_depth_luma != output.bit_depth_luma
-        || tile.bit_depth_chroma != output.bit_depth_chroma
-    {
-        return Err(DecodeHeicError::DecodedBitDepthMismatch {
-            expected_luma: output.bit_depth_luma,
-            expected_chroma: output.bit_depth_chroma,
-            actual_luma: tile.bit_depth_luma,
-            actual_chroma: tile.bit_depth_chroma,
-        });
-    }
-    if tile.ycbcr_range != output.ycbcr_range || tile.ycbcr_matrix != output.ycbcr_matrix {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!("grid tiles have inconsistent YCbCr metadata at index {tile_index}"),
-        });
-    }
+    let reference = HeicGridTileReference::from_output_canvas(output, tile_width, tile_height);
+    validate_decoded_heic_grid_tile_reference(tile, &reference, tile_index)?;
 
     validate_heic_plane_dimensions(&tile.y_plane, tile.width, tile.height, "grid tile Y")?;
-    let column_u64 = u64::try_from(column).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-        detail: format!("grid tile column index {column} cannot be represented"),
-    })?;
-    let row_u64 = u64::try_from(row).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-        detail: format!("grid tile row index {row} cannot be represented"),
-    })?;
-    let x_origin = u32::try_from(column_u64.checked_mul(u64::from(tile_width)).ok_or_else(
-        || DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "grid tile x-origin overflow for column {column} with tile width {tile_width}"
-            ),
-        },
-    )?)
-    .map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-        detail: format!(
-            "grid tile x-origin overflow for column {column} with tile width {tile_width}"
-        ),
-    })?;
-    let y_origin = u32::try_from(row_u64.checked_mul(u64::from(tile_height)).ok_or_else(|| {
-        DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "grid tile y-origin overflow for row {row} with tile height {tile_height}"
-            ),
-        }
-    })?)
-    .map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-        detail: format!("grid tile y-origin overflow for row {row} with tile height {tile_height}"),
-    })?;
+    let (x_origin, y_origin) = heic_grid_tile_origin(tile_width, tile_height, row, column)?;
 
     paste_heic_plane_with_clip(
         &tile.y_plane,
@@ -7993,7 +7980,6 @@ fn paste_heic_grid_tiles_to_transformed_rgba_slice<T: Copy, O: RgbaSampleOutput<
     scale_alpha: fn(u16, u8) -> T,
 ) -> Result<(), DecodeError> {
     let descriptor = &grid_data.descriptor;
-    let columns = usize::from(descriptor.columns);
     let destination_width = usize::try_from(transform_plan.destination_width).map_err(|_| {
         DecodeHeicError::InvalidDecodedFrame {
             detail: format!(
@@ -8018,99 +8004,86 @@ fn paste_heic_grid_tiles_to_transformed_rgba_slice<T: Copy, O: RgbaSampleOutput<
             ),
         }
     })?;
-    let mut first_tile = Some(first_tile);
-    let mut tile_pixels = Vec::new();
-    for tile_index in 0..grid_data.tiles.len() {
-        let mut tile = if tile_index == 0 {
-            first_tile
-                .take()
-                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                    detail: "first grid tile was already consumed".to_string(),
-                })?
-        } else {
-            decode_heic_grid_tile_to_image(&grid_data.tiles[tile_index])?
-        };
-        validate_decoded_heic_grid_tile_reference(&tile, reference, tile_index)?;
-        tile.ycbcr_range = reference.conversion_ycbcr_range;
-        tile.ycbcr_matrix = reference.conversion_ycbcr_matrix;
-        convert_tile(&tile, &mut tile_pixels)?;
+    for_each_heic_grid_tile_rgba(
+        grid_data,
+        first_tile,
+        reference,
+        convert_tile,
+        |tile, tile_pixels, x_origin, y_origin| {
+            let tile_width =
+                usize::try_from(tile.width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!("grid tile width {} cannot be represented", tile.width),
+                })?;
+            let tile_height =
+                usize::try_from(tile.height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!("grid tile height {} cannot be represented", tile.height),
+                })?;
+            validate_rgba_paste_buffer_len(
+                tile_pixels.len(),
+                tile_width,
+                tile_height,
+                tile.width,
+                tile.height,
+                "grid tile RGBA",
+                "source",
+            )?;
 
-        let tile_width =
-            usize::try_from(tile.width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-                detail: format!("grid tile width {} cannot be represented", tile.width),
-            })?;
-        let tile_height =
-            usize::try_from(tile.height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-                detail: format!("grid tile height {} cannot be represented", tile.height),
-            })?;
-        validate_rgba_paste_buffer_len(
-            tile_pixels.len(),
-            tile_width,
-            tile_height,
-            tile.width,
-            tile.height,
-            "grid tile RGBA",
-            "source",
-        )?;
+            let x_origin =
+                usize::try_from(x_origin).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+                    detail: "grid tile x-origin cannot be represented".to_string(),
+                })?;
+            let y_origin =
+                usize::try_from(y_origin).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+                    detail: "grid tile y-origin cannot be represented".to_string(),
+                })?;
 
-        let row = tile_index / columns;
-        let column = tile_index % columns;
-        let (x_origin, y_origin) =
-            heic_grid_tile_origin(reference.tile_width, reference.tile_height, row, column)?;
-        validate_heic_grid_tile_origin_alignment(reference.layout, x_origin, y_origin)?;
-        let x_origin =
-            usize::try_from(x_origin).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-                detail: "grid tile x-origin cannot be represented".to_string(),
-            })?;
-        let y_origin =
-            usize::try_from(y_origin).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-                detail: "grid tile y-origin cannot be represented".to_string(),
-            })?;
-
-        for tile_y in 0..tile_height {
-            let source_y = y_origin.checked_add(tile_y).ok_or_else(|| {
-                DecodeHeicError::InvalidDecodedFrame {
-                    detail: "grid tile source y-coordinate overflow".to_string(),
-                }
-            })?;
-            if source_y >= source_height {
-                break;
-            }
-            for tile_x in 0..tile_width {
-                let source_x = x_origin.checked_add(tile_x).ok_or_else(|| {
+            for tile_y in 0..tile_height {
+                let source_y = y_origin.checked_add(tile_y).ok_or_else(|| {
                     DecodeHeicError::InvalidDecodedFrame {
-                        detail: "grid tile source x-coordinate overflow".to_string(),
+                        detail: "grid tile source y-coordinate overflow".to_string(),
                     }
                 })?;
-                if source_x >= source_width {
+                if source_y >= source_height {
                     break;
                 }
-                let Some((destination_x, destination_y)) =
-                    transform_plan.map_source_pixel(source_x, source_y)?
-                else {
-                    continue;
-                };
-                // In-bounds by construction (`validate_rgba_paste_buffer_len`
-                // proved the tile sample count fits usize, the plan maps into
-                // the validated destination canvas), so plain indexing cannot
-                // overflow — same as the coded HEIC/AVIF per-pixel loops.
-                let source_sample = (tile_y * tile_width + tile_x) * 4;
-                let destination_sample = (destination_y * destination_width + destination_x) * 4;
-                output.write_sample(destination_sample, tile_pixels[source_sample]);
-                output.write_sample(destination_sample + 1, tile_pixels[source_sample + 1]);
-                output.write_sample(destination_sample + 2, tile_pixels[source_sample + 2]);
-                output.write_sample(
-                    destination_sample + 3,
-                    auxiliary_alpha.map_or(tile_pixels[source_sample + 3], |alpha| {
-                        let alpha_index = source_y * source_width + source_x;
-                        scale_alpha(alpha.samples[alpha_index], alpha.bit_depth)
-                    }),
-                );
+                for tile_x in 0..tile_width {
+                    let source_x = x_origin.checked_add(tile_x).ok_or_else(|| {
+                        DecodeHeicError::InvalidDecodedFrame {
+                            detail: "grid tile source x-coordinate overflow".to_string(),
+                        }
+                    })?;
+                    if source_x >= source_width {
+                        break;
+                    }
+                    let Some((destination_x, destination_y)) =
+                        transform_plan.map_source_pixel(source_x, source_y)?
+                    else {
+                        continue;
+                    };
+                    // In-bounds by construction
+                    // (`validate_rgba_paste_buffer_len` proved the tile sample
+                    // count fits usize, the plan maps into the validated
+                    // destination canvas), so plain indexing cannot overflow —
+                    // same as the coded HEIC/AVIF per-pixel loops.
+                    let source_sample = (tile_y * tile_width + tile_x) * 4;
+                    let destination_sample =
+                        (destination_y * destination_width + destination_x) * 4;
+                    output.write_sample(destination_sample, tile_pixels[source_sample]);
+                    output.write_sample(destination_sample + 1, tile_pixels[source_sample + 1]);
+                    output.write_sample(destination_sample + 2, tile_pixels[source_sample + 2]);
+                    output.write_sample(
+                        destination_sample + 3,
+                        auxiliary_alpha.map_or(tile_pixels[source_sample + 3], |alpha| {
+                            let alpha_index = source_y * source_width + source_x;
+                            scale_alpha(alpha.samples[alpha_index], alpha.bit_depth)
+                        }),
+                    );
+                }
             }
-        }
-    }
 
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 #[cfg(feature = "image-integration")]
