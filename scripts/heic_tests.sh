@@ -1348,6 +1348,12 @@ EOF
     if cmp -s "$ref_raw" "$rust_raw"; then
       local icc_failure
       if icc_failure="$(compare_png_icc "$ref_actual" "$rust_actual" "$tmp_dir/$id")"; then
+        # Deliberately run for EVERY passing file even though it re-decodes
+        # the file twice more (direct + hook): the image-crate hook is a
+        # separate decode path (lazy adapter, caller-buffer slices) whose
+        # parity with the direct decode is a hard correctness requirement,
+        # so it gets the same per-file coverage as the validator comparison.
+        # Do not sample or gate this to save CI time.
         local hook_log hook_status
         hook_log="$tmp_dir/$id.image-hook.check.stderr.log"
         if check_with_image_hook_helper "$input_file" >/dev/null 2>"$hook_log"; then
