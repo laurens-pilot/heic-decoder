@@ -6504,56 +6504,116 @@ fn decode_hevc_stream_metadata_from_sps(
         if nal_unit.nal_unit_type() != Some(NALUnitType::SpsNut) {
             continue;
         }
-        let nal_offset = nal_unit.offset;
-
-        let sps = heic_decoder::hevc::bitstream::parse_single_nal(nal_unit.bytes)
-            .and_then(|nal| heic_decoder::hevc::params::parse_sps(&nal.payload))
-            .map_err(|err| DecodeHeicError::SpsParseFailed {
-                offset: nal_offset,
-                detail: err.to_string(),
-            })?;
-
-        let (sub_width_c, sub_height_c) = match sps.chroma_format_idc {
-            1 => (2u32, 2u32),
-            2 => (2, 1),
-            _ => (1, 1),
-        };
-        let crop_x = sps
-            .conf_win_offset
-            .0
-            .saturating_add(sps.conf_win_offset.1)
-            .saturating_mul(sub_width_c);
-        let crop_y = sps
-            .conf_win_offset
-            .2
-            .saturating_add(sps.conf_win_offset.3)
-            .saturating_mul(sub_height_c);
-        let width = sps.pic_width_in_luma_samples.saturating_sub(crop_x);
-        let height = sps.pic_height_in_luma_samples.saturating_sub(crop_y);
-        if width == 0 || height == 0 {
-            return Err(DecodeHeicError::InvalidSpsGeometry {
-                width: u64::from(width),
-                height: u64::from(height),
-            });
-        }
-
-        let chroma_array_type = if sps.separate_colour_plane_flag {
-            0
-        } else {
-            sps.chroma_format_idc
-        };
-        let layout = heic_layout_from_sps_chroma_array_type(chroma_array_type)?;
-
-        return Ok(DecodedHeicImageMetadata {
-            width,
-            height,
-            bit_depth_luma: sps.bit_depth_y(),
-            bit_depth_chroma: sps.bit_depth_c(),
-            layout,
-        });
+        return hevc_metadata_from_sps_nal(nal_unit.bytes, nal_unit.offset);
     }
 
     Err(DecodeHeicError::MissingSpsNalUnit)
+}
+
+/// Parse decoded-image metadata from a single SPS NAL unit; `nal_offset` is
+/// only used to locate parse failures in error details.
+fn hevc_metadata_from_sps_nal(
+    nal_bytes: &[u8],
+    nal_offset: usize,
+) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
+    let sps = heic_decoder::hevc::bitstream::parse_single_nal(nal_bytes)
+        .and_then(|nal| heic_decoder::hevc::params::parse_sps(&nal.payload))
+        .map_err(|err| DecodeHeicError::SpsParseFailed {
+            offset: nal_offset,
+            detail: err.to_string(),
+        })?;
+
+    let (sub_width_c, sub_height_c) = match sps.chroma_format_idc {
+        1 => (2u32, 2u32),
+        2 => (2, 1),
+        _ => (1, 1),
+    };
+    let crop_x = sps
+        .conf_win_offset
+        .0
+        .saturating_add(sps.conf_win_offset.1)
+        .saturating_mul(sub_width_c);
+    let crop_y = sps
+        .conf_win_offset
+        .2
+        .saturating_add(sps.conf_win_offset.3)
+        .saturating_mul(sub_height_c);
+    let width = sps.pic_width_in_luma_samples.saturating_sub(crop_x);
+    let height = sps.pic_height_in_luma_samples.saturating_sub(crop_y);
+    if width == 0 || height == 0 {
+        return Err(DecodeHeicError::InvalidSpsGeometry {
+            width: u64::from(width),
+            height: u64::from(height),
+        });
+    }
+
+    let chroma_array_type = if sps.separate_colour_plane_flag {
+        0
+    } else {
+        sps.chroma_format_idc
+    };
+    let layout = heic_layout_from_sps_chroma_array_type(chroma_array_type)?;
+
+    Ok(DecodedHeicImageMetadata {
+        width,
+        height,
+        bit_depth_luma: sps.bit_depth_y(),
+        bit_depth_chroma: sps.bit_depth_c(),
+        layout,
+    })
+}
+
+/// SPS-derived metadata from the hvcC parameter-set arrays alone, or `None`
+/// when the arrays carry no SPS (`hev1` items may keep parameter sets only
+/// in-stream). Selection matches the assembled-stream scan: first NAL whose
+/// own header says SPS, in hvcC array order.
+#[cfg(feature = "image-integration")]
+fn hevc_metadata_from_hvcc_nal_arrays(
+    hvcc: &isobmff::HevcDecoderConfigurationBox,
+) -> Result<Option<DecodedHeicImageMetadata>, DecodeHeicError> {
+    for nal_array in &hvcc.nal_arrays {
+        for nal_unit in &nal_array.nal_units {
+            let unit = LengthPrefixedHevcNalUnit {
+                offset: 0,
+                bytes: nal_unit,
+            };
+            if unit.nal_unit_type() != Some(NALUnitType::SpsNut) {
+                continue;
+            }
+            return hevc_metadata_from_sps_nal(nal_unit, 0).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// SPS-derived metadata without assembling a decoder stream: prefer the hvcC
+/// parameter-set arrays, then scan the item payload's length-prefixed NAL
+/// units in place. This visits NAL units in the same order as assembling the
+/// stream and scanning it, but copies no payload bytes — the layout probe
+/// runs this once per image-hook decode.
+#[cfg(feature = "image-integration")]
+fn decode_hevc_metadata_from_hvcc_or_payload(
+    hvcc: &isobmff::HevcDecoderConfigurationBox,
+    payload: &[u8],
+) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
+    let nal_length_size = hvcc.nal_length_size;
+    if !(1..=4).contains(&nal_length_size) {
+        return Err(DecodeHeicError::InvalidNalLengthSize { nal_length_size });
+    }
+    if let Some(metadata) = hevc_metadata_from_hvcc_nal_arrays(hvcc)? {
+        return Ok(metadata);
+    }
+
+    let mut metadata = None;
+    walk_length_prefixed_payload_nals(payload, usize::from(nal_length_size), |offset, nal| {
+        let unit = LengthPrefixedHevcNalUnit { offset, bytes: nal };
+        if unit.nal_unit_type() != Some(NALUnitType::SpsNut) {
+            return Ok(false);
+        }
+        metadata = Some(hevc_metadata_from_sps_nal(nal, offset)?);
+        Ok(true)
+    })?;
+    metadata.ok_or(DecodeHeicError::MissingSpsNalUnit)
 }
 
 fn heic_layout_from_sps_chroma_array_type(
@@ -7565,8 +7625,8 @@ fn heic_grid_source_bit_depth_for_png_conversion(
             .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
                 detail: "grid tile list cannot be empty".to_string(),
             })?;
-    let stream = assemble_heic_hevc_stream_from_components(&first_tile.hvcc, &first_tile.payload)?;
-    let metadata = decode_hevc_stream_metadata_from_sps(&stream)?;
+    let metadata =
+        decode_hevc_metadata_from_hvcc_or_payload(&first_tile.hvcc, &first_tile.payload)?;
     heic_bit_depth_for_png_conversion_metadata(&metadata)
 }
 
@@ -7624,6 +7684,33 @@ fn decode_heif_bytes_to_rgba_layout(
         .map_err(DecodeHeicError::ParsePrimaryTransforms)?
         .transforms;
     let icc_profile = primary_icc_profile_from_heic(input);
+
+    // Coded (hvc1/hev1) primary items normally carry the SPS in their hvcC
+    // property, so the probe can read geometry and bit depth without
+    // extracting a single payload byte. On any miss — grid primary, hev1
+    // with in-stream parameter sets, or a preflight/SPS/geometry problem —
+    // fall through to the extraction path below so errors stay identical to
+    // the decode path's.
+    if let Ok(preflight) = isobmff::parse_primary_heic_item_preflight_properties(input)
+        && let Ok(Some(metadata)) = hevc_metadata_from_hvcc_nal_arrays(&preflight.hvcc)
+        && validate_decoded_heic_geometry_against_ispe(
+            &metadata,
+            preflight.ispe.width,
+            preflight.ispe.height,
+        )
+        .is_ok()
+    {
+        guardrails.enforce_pixel_count(metadata.width, metadata.height)?;
+        let source_bit_depth = heic_bit_depth_for_png_conversion_metadata(&metadata)?;
+        return decoded_rgba_layout_from_heic_geometry(
+            metadata.width,
+            metadata.height,
+            source_bit_depth,
+            &transforms,
+            icc_profile,
+        );
+    }
+
     let primary_with_grid =
         isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?;
 
@@ -10675,6 +10762,20 @@ fn append_normalized_hevc_payload_nals(
     nal_length_size: usize,
     stream: &mut Vec<u8>,
 ) -> Result<(), DecodeHeicError> {
+    walk_length_prefixed_payload_nals(payload, nal_length_size, |_, nal_unit| {
+        append_nal_with_u32_length_prefix(nal_unit, stream)?;
+        Ok(false)
+    })
+}
+
+/// Walk the length-prefixed NAL units of an item payload in place, calling
+/// `visit` with each unit's payload offset and bytes until it returns `true`
+/// to stop early.
+fn walk_length_prefixed_payload_nals(
+    payload: &[u8],
+    nal_length_size: usize,
+    mut visit: impl FnMut(usize, &[u8]) -> Result<bool, DecodeHeicError>,
+) -> Result<(), DecodeHeicError> {
     let mut cursor = 0usize;
     while cursor < payload.len() {
         let length_field_start = cursor;
@@ -10703,7 +10804,9 @@ fn append_normalized_hevc_payload_nals(
         }
 
         let nal_end = cursor + nal_size;
-        append_nal_with_u32_length_prefix(&payload[cursor..nal_end], stream)?;
+        if visit(cursor, &payload[cursor..nal_end])? {
+            return Ok(());
+        }
         cursor = nal_end;
     }
 
@@ -12475,6 +12578,102 @@ mod tests {
         assert_eq!(width, orientation_transform.destination_width);
         assert_eq!(height, orientation_transform.destination_height);
         assert_eq!(direct, transformed);
+    }
+
+    #[cfg(feature = "image-integration")]
+    fn test_hvcc(
+        nal_arrays: Vec<super::isobmff::HevcNalArray>,
+        nal_length_size: u8,
+    ) -> super::isobmff::HevcDecoderConfigurationBox {
+        super::isobmff::HevcDecoderConfigurationBox {
+            configuration_version: 1,
+            general_profile_space: 0,
+            general_tier_flag: false,
+            general_profile_idc: 1,
+            general_profile_compatibility_flags: 0,
+            general_constraint_indicator_flags: [0; 6],
+            general_level_idc: 0,
+            min_spatial_segmentation_idc: 0,
+            parallelism_type: 0,
+            chroma_format: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            avg_frame_rate: 0,
+            constant_frame_rate: 0,
+            num_temporal_layers: 1,
+            temporal_id_nested: true,
+            nal_length_size,
+            nal_arrays,
+        }
+    }
+
+    /// The layout probe's assembly-free SPS read: hvcC parameter sets are
+    /// preferred, and `hev1`-style payloads whose parameter sets live only
+    /// in-stream are scanned in place. Exercised here because real hev1
+    /// files are rare enough that the verify corpus may not cover the
+    /// fallback.
+    #[cfg(feature = "image-integration")]
+    #[test]
+    fn hevc_probe_metadata_scans_payload_when_hvcc_lacks_sps() {
+        use super::DecodeHeicError;
+        use super::isobmff::HevcNalArray;
+
+        // hvcC carrying only a VPS (type 32): the probe must fall back to
+        // the payload, find the SPS NAL (type 33) by its own header, and
+        // report its parse failure at the payload offset.
+        let vps_only = test_hvcc(
+            vec![HevcNalArray {
+                array_completeness: true,
+                nal_unit_type: 32,
+                nal_units: vec![vec![0x40, 0x01]],
+            }],
+            4,
+        );
+        let payload_with_sps = [0, 0, 0, 2, 0x42, 0x01];
+        assert!(matches!(
+            super::decode_hevc_metadata_from_hvcc_or_payload(&vps_only, &payload_with_sps),
+            Err(DecodeHeicError::SpsParseFailed { offset: 4, .. })
+        ));
+
+        // No SPS in hvcC or payload.
+        let payload_without_sps = [0, 0, 0, 2, 0x40, 0x01];
+        assert!(matches!(
+            super::decode_hevc_metadata_from_hvcc_or_payload(&vps_only, &payload_without_sps),
+            Err(DecodeHeicError::MissingSpsNalUnit)
+        ));
+
+        // An hvcC SPS wins before any payload bytes are considered: the
+        // truncated SPS in hvcC is reported at offset 0, not the payload's.
+        let sps_in_hvcc = test_hvcc(
+            vec![HevcNalArray {
+                array_completeness: true,
+                nal_unit_type: 33,
+                nal_units: vec![vec![0x42, 0x01]],
+            }],
+            4,
+        );
+        assert!(matches!(
+            super::decode_hevc_metadata_from_hvcc_or_payload(&sps_in_hvcc, &payload_with_sps),
+            Err(DecodeHeicError::SpsParseFailed { offset: 0, .. })
+        ));
+
+        // Malformed payload structure still fails loudly during the scan.
+        assert!(matches!(
+            super::decode_hevc_metadata_from_hvcc_or_payload(&vps_only, &[0, 0]),
+            Err(DecodeHeicError::TruncatedNalLengthField { .. })
+        ));
+        assert!(matches!(
+            super::decode_hevc_metadata_from_hvcc_or_payload(&vps_only, &[0, 0, 0, 9, 0x42]),
+            Err(DecodeHeicError::TruncatedNalUnit { .. })
+        ));
+
+        // nal_length_size outside 1..=4 is rejected up front, matching the
+        // stream-assembly path.
+        let bad_length_size = test_hvcc(Vec::new(), 0);
+        assert!(matches!(
+            super::decode_hevc_metadata_from_hvcc_or_payload(&bad_length_size, &payload_with_sps),
+            Err(DecodeHeicError::InvalidNalLengthSize { nal_length_size: 0 })
+        ));
     }
 
     #[cfg(feature = "image-integration")]
