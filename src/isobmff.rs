@@ -7292,12 +7292,14 @@ pub(crate) mod test_support {
     ///
     /// Returns the file bytes, the RGBA8 pixels a decode must produce, and
     /// the raw TIFF block `ImageDecoder::exif_metadata` must hand back.
+    #[cfg(feature = "image-integration")]
     pub(crate) fn minimal_uncompressed_rgb3_heif_with_exif_orientation(
         orientation: u16,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         minimal_uncompressed_rgb3_heif_with_exif_orientation_and_transforms(orientation, &[])
     }
 
+    #[cfg(feature = "image-integration")]
     pub(crate) fn irot_box(rotation_ccw_quarter_turns: u8) -> Vec<u8> {
         plain_box(b"irot", &[rotation_ccw_quarter_turns & 0x03])
     }
@@ -7308,6 +7310,7 @@ pub(crate) mod test_support {
     ///
     /// The returned RGBA pixels are the untransformed samples; callers that
     /// pass transforms derive their own expected output.
+    #[cfg(feature = "image-integration")]
     pub(crate) fn minimal_uncompressed_rgb3_heif_with_exif_orientation_and_transforms(
         orientation: u16,
         transform_properties: &[Vec<u8>],
