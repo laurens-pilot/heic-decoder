@@ -862,6 +862,48 @@ mod tests {
         assert_eq!(pixels, expected_rotated);
     }
 
+    /// An identity `irot` (angle 0) bakes nothing into the pixels, so it
+    /// must NOT suppress the EXIF-derived orientation: suppressing here
+    /// would leave generic `orientation()` + `apply_orientation` callers
+    /// with an unrotated image. Locks the identity gate shared with
+    /// `ExifOrientationHint::should_apply_exif_orientation`.
+    #[test]
+    fn hook_decoder_keeps_exif_orientation_for_identity_irot() {
+        let (file, expected_rgba, expected_tiff) = crate::isobmff::test_support::
+            minimal_uncompressed_rgb3_heif_with_exif_orientation_and_transforms(
+                6,
+                &[crate::isobmff::test_support::irot_box(0)],
+            );
+
+        let mut decoder = decoder_from_seekable_with_hint_and_guardrails(
+            Cursor::new(file),
+            Some(HeifInputFamily::Heif),
+            DecodeGuardrails::default(),
+        )
+        .expect("hook construction should succeed");
+
+        assert_eq!(
+            decoder
+                .exif_metadata()
+                .expect("exif metadata read should succeed"),
+            Some(expected_tiff)
+        );
+        assert_eq!(
+            decoder
+                .orientation()
+                .expect("orientation read should succeed"),
+            image::metadata::Orientation::Rotate90
+        );
+
+        // The identity irot leaves the pixels untouched and unrotated.
+        assert_eq!(decoder.dimensions(), (2, 1));
+        let mut pixels = vec![0_u8; expected_rgba.len()];
+        decoder
+            .read_image_boxed(&mut pixels)
+            .expect("lazy uncompressed decode should succeed");
+        assert_eq!(pixels, expected_rgba);
+    }
+
     #[test]
     fn hook_decoder_survives_lying_seek_length() {
         let (file, expected_rgba) = crate::isobmff::test_support::minimal_uncompressed_rgb3_heif();
