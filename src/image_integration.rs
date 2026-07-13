@@ -219,14 +219,6 @@ fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
     )))
 }
 
-/// Pre-allocation ceiling for the seek-reported input length. The reported
-/// length is untrusted until the bytes are actually read: a lying or corrupt
-/// reader could otherwise trigger a multi-gigabyte allocation (or a
-/// capacity-overflow panic) before a single byte arrives. `read_to_end` still
-/// grows the buffer past this for genuinely larger, guardrail-permitted
-/// inputs.
-const MAX_INPUT_PREALLOCATION_BYTES: u64 = 128 * 1024 * 1024;
-
 /// Default `max_input_bytes` applied by [`register_image_decoder_hooks`].
 ///
 /// Hook decodes buffer the entire encoded input, so an unbounded default
@@ -234,6 +226,14 @@ const MAX_INPUT_PREALLOCATION_BYTES: u64 = 128 * 1024 * 1024;
 /// multi-gigabyte `mdat`) allocate its full size. Callers that need larger
 /// inputs can register with explicit guardrails via
 /// [`register_image_decoder_hooks_with_guardrails`].
+///
+/// This limit also serves as the pre-allocation ceiling for the
+/// seek-reported input length in [`read_seekable_input_to_vec`]: the
+/// reported length is untrusted until the bytes are actually read, and a
+/// lying or corrupt reader could otherwise trigger a multi-gigabyte
+/// allocation (or a capacity-overflow panic) before a single byte arrives.
+/// `read_to_end` still grows the buffer past this ceiling for genuinely
+/// larger, guardrail-permitted inputs.
 pub const DEFAULT_HOOK_MAX_INPUT_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Read the whole encoded input into memory.
@@ -258,7 +258,7 @@ fn read_seekable_input_to_vec<R: Read + Seek>(
     input_reader
         .seek(SeekFrom::Start(0))
         .map_err(ImageError::IoError)?;
-    let prealloc_len = input_len.min(MAX_INPUT_PREALLOCATION_BYTES);
+    let prealloc_len = input_len.min(DEFAULT_HOOK_MAX_INPUT_BYTES);
     let capacity = usize::try_from(prealloc_len).map_err(|_| {
         parameter_error(format!(
             "input size {prealloc_len} bytes does not fit in memory on this platform"
