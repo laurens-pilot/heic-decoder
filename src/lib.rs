@@ -4203,36 +4203,102 @@ const MAX_GRID_TILE_DECODE_THREADS: usize = 8;
 #[cfg(feature = "parallel-grid")]
 const GRID_TILE_DECODE_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
 
-/// Choose a conservative number of simultaneously decoded tiles. The estimate
-/// includes both retained YUV output and decoder working storage, keeping large
-/// or unusual tiles sequential instead of multiplying peak memory.
+/// Estimate the normalized decoder stream plus retained YUV output and decoder
+/// working storage for one tile. Raw SPS geometry is deliberately used here:
+/// a tile-level clean aperture may make the final tile small, but the decoder
+/// must still materialize the uncropped frame first.
 #[cfg(feature = "parallel-grid")]
-fn heic_grid_tile_decode_window(
-    reference: &HeicGridTileReference,
-    remaining_tiles: usize,
-) -> usize {
-    if remaining_tiles <= 1 || cfg!(feature = "decoder-tracing") {
-        return 1;
-    }
-
-    let available_threads = rayon::current_num_threads()
-        .min(MAX_GRID_TILE_DECODE_THREADS)
-        .min(remaining_tiles);
-    let working_bytes_per_pixel = match reference.layout {
+fn estimate_heic_grid_tile_decode_bytes(
+    tile: &isobmff::HeicGridTileItemData,
+) -> Result<u64, DecodeHeicError> {
+    let metadata = decode_hevc_metadata_from_hvcc_or_payload(&tile.hvcc, &tile.payload)?;
+    let working_bytes_per_pixel = match metadata.layout {
         HeicPixelLayout::Yuv400 => 4_u64,
         HeicPixelLayout::Yuv420 => 6,
         HeicPixelLayout::Yuv422 => 8,
         HeicPixelLayout::Yuv444 => 12,
     };
-    let estimated_tile_bytes = u64::from(reference.tile_width)
-        .saturating_mul(u64::from(reference.tile_height))
-        .saturating_mul(working_bytes_per_pixel)
-        .max(1);
-    let memory_limited = usize::try_from(GRID_TILE_DECODE_MEMORY_BUDGET / estimated_tile_bytes)
-        .unwrap_or(usize::MAX)
-        .max(1);
+    let decoded_bytes = u64::from(metadata.width)
+        .saturating_mul(u64::from(metadata.height))
+        .saturating_mul(working_bytes_per_pixel);
 
-    available_threads.min(memory_limited).max(1)
+    let mut stream_bytes = 0_u64;
+    for nal_array in &tile.hvcc.nal_arrays {
+        for nal_unit in &nal_array.nal_units {
+            let nal_size =
+                u32::try_from(nal_unit.len()).map_err(|_| DecodeHeicError::NalUnitTooLarge {
+                    nal_size: nal_unit.len(),
+                })?;
+            stream_bytes = stream_bytes
+                .saturating_add(u64::from(nal_size))
+                .saturating_add(4);
+        }
+    }
+    walk_length_prefixed_payload_nals(
+        &tile.payload,
+        usize::from(tile.hvcc.nal_length_size),
+        |_, nal_unit| {
+            let nal_size =
+                u32::try_from(nal_unit.len()).map_err(|_| DecodeHeicError::NalUnitTooLarge {
+                    nal_size: nal_unit.len(),
+                })?;
+            stream_bytes = stream_bytes
+                .saturating_add(u64::from(nal_size))
+                .saturating_add(4);
+            Ok(false)
+        },
+    )?;
+
+    Ok(decoded_bytes.saturating_add(stream_bytes).max(1))
+}
+
+/// Choose a conservative number of simultaneously decoded tiles from each
+/// tile's own preflight estimate. An estimate failure stops the parallel
+/// window before that tile so normal row-major decoding still selects the
+/// user-visible error.
+#[cfg(feature = "parallel-grid")]
+fn heic_grid_tile_decode_window_from_estimates(
+    estimates: impl IntoIterator<Item = Option<u64>>,
+    available_threads: usize,
+) -> usize {
+    let available_threads = available_threads.max(1);
+    let mut window = 0_usize;
+    let mut estimated_bytes = 0_u64;
+    for tile_bytes in estimates.into_iter().take(available_threads) {
+        let Some(tile_bytes) = tile_bytes else {
+            break;
+        };
+        let next_estimated_bytes = estimated_bytes.saturating_add(tile_bytes.max(1));
+        if window > 0 && next_estimated_bytes > GRID_TILE_DECODE_MEMORY_BUDGET {
+            break;
+        }
+        window += 1;
+        estimated_bytes = next_estimated_bytes;
+        if estimated_bytes >= GRID_TILE_DECODE_MEMORY_BUDGET {
+            break;
+        }
+    }
+    window.max(1)
+}
+
+/// Choose a conservative number of simultaneously decoded tiles. Large,
+/// malformed, or unusual tiles stay sequential instead of inheriting the
+/// first grid tile's geometry and multiplying peak memory.
+#[cfg(feature = "parallel-grid")]
+fn heic_grid_tile_decode_window(remaining_tiles: &[isobmff::HeicGridTileItemData]) -> usize {
+    if remaining_tiles.len() <= 1 || cfg!(feature = "decoder-tracing") {
+        return 1;
+    }
+
+    let available_threads = rayon::current_num_threads()
+        .min(MAX_GRID_TILE_DECODE_THREADS)
+        .min(remaining_tiles.len());
+    heic_grid_tile_decode_window_from_estimates(
+        remaining_tiles
+            .iter()
+            .map(|tile| estimate_heic_grid_tile_decode_bytes(tile).ok()),
+        available_threads,
+    )
 }
 
 /// Decode grid tiles in bounded batches, but deliver them to the caller in
@@ -4248,11 +4314,6 @@ where
     E: From<DecodeHeicError>,
 {
     let remaining_tiles = &grid_data.tiles[1..];
-    #[cfg(feature = "parallel-grid")]
-    let window = {
-        let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
-        heic_grid_tile_decode_window(&reference, remaining_tiles.len())
-    };
 
     consume(0, first_tile)?;
 
@@ -4262,30 +4323,42 @@ where
 
     #[cfg(feature = "parallel-grid")]
     {
-        if window > 1 {
-            for (chunk_index, chunk) in remaining_tiles.chunks(window).enumerate() {
-                let decoded = chunk
+        let mut next_tile_index = 1_usize;
+        while next_tile_index < grid_data.tiles.len() {
+            let undecoded_tiles = &grid_data.tiles[next_tile_index..];
+            let window = heic_grid_tile_decode_window(undecoded_tiles);
+            if window > 1 {
+                let decoded = undecoded_tiles[..window]
                     .par_iter()
                     .map(decode_heic_grid_tile_to_image)
                     .collect::<Vec<_>>();
 
-                let chunk_start = 1 + chunk_index * window;
                 for (offset, tile) in decoded.into_iter().enumerate() {
-                    consume(chunk_start + offset, tile.map_err(E::from)?)?;
+                    consume(next_tile_index + offset, tile.map_err(E::from)?)?;
                 }
+                next_tile_index += window;
+            } else {
+                consume(
+                    next_tile_index,
+                    decode_heic_grid_tile_to_image(&grid_data.tiles[next_tile_index])
+                        .map_err(E::from)?,
+                )?;
+                next_tile_index += 1;
             }
-            return Ok(());
         }
+        Ok(())
     }
 
-    for (offset, tile) in remaining_tiles.iter().enumerate() {
-        consume(
-            offset + 1,
-            decode_heic_grid_tile_to_image(tile).map_err(E::from)?,
-        )?;
+    #[cfg(not(feature = "parallel-grid"))]
+    {
+        for (offset, tile) in remaining_tiles.iter().enumerate() {
+            consume(
+                offset + 1,
+                decode_heic_grid_tile_to_image(tile).map_err(E::from)?,
+            )?;
+        }
+        Ok(())
     }
-
-    Ok(())
 }
 
 fn decode_heic_grid_tile_to_image(
@@ -6739,7 +6812,7 @@ fn hevc_metadata_from_sps_nal(
 /// when the arrays carry no SPS (`hev1` items may keep parameter sets only
 /// in-stream). Selection matches the assembled-stream scan: first NAL whose
 /// own header says SPS, in hvcC array order.
-#[cfg(feature = "image-integration")]
+#[cfg(any(feature = "image-integration", feature = "parallel-grid"))]
 fn hevc_metadata_from_hvcc_nal_arrays(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
 ) -> Result<Option<DecodedHeicImageMetadata>, DecodeHeicError> {
@@ -6763,7 +6836,7 @@ fn hevc_metadata_from_hvcc_nal_arrays(
 /// units in place. This visits NAL units in the same order as assembling the
 /// stream and scanning it, but copies no payload bytes — the layout probe
 /// runs this once per image-hook decode.
-#[cfg(feature = "image-integration")]
+#[cfg(any(feature = "image-integration", feature = "parallel-grid"))]
 fn decode_hevc_metadata_from_hvcc_or_payload(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
     payload: &[u8],
@@ -12941,6 +13014,45 @@ mod tests {
         assert_eq!(width, orientation_transform.destination_width);
         assert_eq!(height, orientation_transform.destination_height);
         assert_eq!(direct, transformed);
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    #[test]
+    fn grid_parallel_window_uses_each_candidate_tile_estimate() {
+        const MIB: u64 = 1024 * 1024;
+
+        assert_eq!(
+            super::heic_grid_tile_decode_window_from_estimates(
+                [Some(4 * MIB), Some(80 * MIB), Some(4 * MIB)],
+                8,
+            ),
+            1,
+            "a later oversized tile must not inherit the first candidate's small estimate"
+        );
+        assert_eq!(
+            super::heic_grid_tile_decode_window_from_estimates(
+                [Some(32 * MIB), Some(32 * MIB), Some(MIB)],
+                8,
+            ),
+            2,
+            "a window may fill the memory budget exactly"
+        );
+        assert_eq!(
+            super::heic_grid_tile_decode_window_from_estimates(
+                [Some(4 * MIB), None, Some(4 * MIB)],
+                8,
+            ),
+            1,
+            "a tile whose metadata cannot be preflighted must stay outside the parallel window"
+        );
+        assert_eq!(
+            super::heic_grid_tile_decode_window_from_estimates(
+                core::iter::repeat_n(Some(MIB), 16),
+                8,
+            ),
+            8,
+            "the thread cap must remain effective for small tiles"
+        );
     }
 
     #[cfg(feature = "image-integration")]
