@@ -30,6 +30,8 @@ use rav1d::{
     Dav1dResult, Rav1dError, dav1d_close, dav1d_data_create, dav1d_data_unref,
     dav1d_default_settings, dav1d_get_picture, dav1d_open, dav1d_picture_unref, dav1d_send_data,
 };
+#[cfg(feature = "parallel-grid")]
+use rayon::prelude::*;
 use scuffle_h265::NALUnitType;
 use source::{
     FileSource, RandomAccessSource, SourceReadError, TempFileSpoolOptions, TempFileSpoolSource,
@@ -4160,45 +4162,116 @@ fn decode_primary_heic_grid_to_image(
         });
     }
 
-    let mut output = None;
-    let mut tile_width = 0;
-    let mut tile_height = 0;
+    let first_tile = decode_heic_grid_tile_to_image(&grid_data.tiles[0])?;
+    let tile_width = first_tile.width;
+    let tile_height = first_tile.height;
+    let mut output = create_decoded_heic_grid_output(descriptor, &first_tile)?;
 
-    for row in 0..rows {
-        for column in 0..columns {
-            let tile_index = row
-                .checked_mul(columns)
-                .and_then(|idx| idx.checked_add(column))
-                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                    detail: format!("grid tile index overflow at row={row}, column={column}"),
-                })?;
-            let tile = decode_heic_grid_tile_to_image(&grid_data.tiles[tile_index])?;
+    for_each_decoded_heic_grid_tile(grid_data, first_tile, |tile_index, tile| {
+        let row = tile_index / columns;
+        let column = tile_index % columns;
+        paste_decoded_heic_grid_tile(
+            &tile,
+            &mut output,
+            tile_width,
+            tile_height,
+            row,
+            column,
+            tile_index,
+        )
+    })?;
 
-            if tile_index == 0 {
-                tile_width = tile.width;
-                tile_height = tile.height;
-                output = Some(create_decoded_heic_grid_output(descriptor, &tile)?);
+    Ok(output)
+}
+
+#[cfg(feature = "parallel-grid")]
+const MAX_GRID_TILE_DECODE_THREADS: usize = 8;
+#[cfg(feature = "parallel-grid")]
+const GRID_TILE_DECODE_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// Choose a conservative number of simultaneously decoded tiles. The estimate
+/// includes both retained YUV output and decoder working storage, keeping large
+/// or unusual tiles sequential instead of multiplying peak memory.
+#[cfg(feature = "parallel-grid")]
+fn heic_grid_tile_decode_window(
+    reference: &HeicGridTileReference,
+    remaining_tiles: usize,
+) -> usize {
+    if remaining_tiles <= 1 || cfg!(feature = "decoder-tracing") {
+        return 1;
+    }
+
+    let available_threads = rayon::current_num_threads()
+        .min(MAX_GRID_TILE_DECODE_THREADS)
+        .min(remaining_tiles);
+    let working_bytes_per_pixel = match reference.layout {
+        HeicPixelLayout::Yuv400 => 4_u64,
+        HeicPixelLayout::Yuv420 => 6,
+        HeicPixelLayout::Yuv422 => 8,
+        HeicPixelLayout::Yuv444 => 12,
+    };
+    let estimated_tile_bytes = u64::from(reference.tile_width)
+        .saturating_mul(u64::from(reference.tile_height))
+        .saturating_mul(working_bytes_per_pixel)
+        .max(1);
+    let memory_limited = usize::try_from(GRID_TILE_DECODE_MEMORY_BUDGET / estimated_tile_bytes)
+        .unwrap_or(usize::MAX)
+        .max(1);
+
+    available_threads.min(memory_limited).max(1)
+}
+
+/// Decode grid tiles in bounded batches, but deliver them to the caller in
+/// row-major order. Keeping validation and paste work on the caller thread
+/// preserves deterministic errors and output while independent HEVC payloads
+/// use the available cores.
+fn for_each_decoded_heic_grid_tile<E>(
+    grid_data: &isobmff::HeicGridPrimaryItemData,
+    first_tile: DecodedHeicImage,
+    mut consume: impl FnMut(usize, DecodedHeicImage) -> Result<(), E>,
+) -> Result<(), E>
+where
+    E: From<DecodeHeicError>,
+{
+    let remaining_tiles = &grid_data.tiles[1..];
+    #[cfg(feature = "parallel-grid")]
+    let window = {
+        let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
+        heic_grid_tile_decode_window(&reference, remaining_tiles.len())
+    };
+
+    consume(0, first_tile)?;
+
+    if remaining_tiles.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    {
+        if window > 1 {
+            for (chunk_index, chunk) in remaining_tiles.chunks(window).enumerate() {
+                let decoded = chunk
+                    .par_iter()
+                    .map(decode_heic_grid_tile_to_image)
+                    .collect::<Vec<_>>();
+
+                let chunk_start = 1 + chunk_index * window;
+                for (offset, tile) in decoded.into_iter().enumerate() {
+                    consume(chunk_start + offset, tile.map_err(E::from)?)?;
+                }
             }
-
-            paste_decoded_heic_grid_tile(
-                &tile,
-                output
-                    .as_mut()
-                    .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                        detail: "grid output was not initialized".to_string(),
-                    })?,
-                tile_width,
-                tile_height,
-                row,
-                column,
-                tile_index,
-            )?;
+            return Ok(());
         }
     }
 
-    output.ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-        detail: "grid tile list cannot be empty".to_string(),
-    })
+    for (offset, tile) in remaining_tiles.iter().enumerate() {
+        consume(
+            offset + 1,
+            decode_heic_grid_tile_to_image(tile).map_err(E::from)?,
+        )?;
+    }
+
+    Ok(())
 }
 
 fn decode_heic_grid_tile_to_image(
@@ -4667,18 +4740,8 @@ fn for_each_heic_grid_tile_rgba<T: Copy>(
     mut paste: impl FnMut(&DecodedHeicImage, &[T], u32, u32) -> Result<(), DecodeError>,
 ) -> Result<(), DecodeError> {
     let columns = usize::from(grid_data.descriptor.columns);
-    let mut first_tile = Some(first_tile);
     let mut tile_pixels = Vec::new();
-    for tile_index in 0..grid_data.tiles.len() {
-        let mut tile = if tile_index == 0 {
-            first_tile
-                .take()
-                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                    detail: "first grid tile was already consumed".to_string(),
-                })?
-        } else {
-            decode_heic_grid_tile_to_image(&grid_data.tiles[tile_index])?
-        };
+    for_each_decoded_heic_grid_tile(grid_data, first_tile, |tile_index, mut tile| {
         validate_decoded_heic_grid_tile_reference(&tile, reference, tile_index)?;
         tile.ycbcr_range = reference.conversion_ycbcr_range;
         tile.ycbcr_matrix = reference.conversion_ycbcr_matrix;
@@ -4689,9 +4752,8 @@ fn for_each_heic_grid_tile_rgba<T: Copy>(
             heic_grid_tile_origin(reference.tile_width, reference.tile_height, row, column)?;
         validate_heic_grid_tile_origin_alignment(reference.layout, x_origin, y_origin)?;
         paste(&tile, &tile_pixels, x_origin, y_origin)?;
-    }
-
-    Ok(())
+        Ok(())
+    })
 }
 
 fn paste_heic_grid_tiles_to_rgba<T: Copy>(

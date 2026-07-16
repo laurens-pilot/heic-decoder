@@ -253,4 +253,33 @@ Conclusion: compiling diagnostics out is worthwhile production cleanup and
 removes global synchronization and unused allocations, but it did not produce
 a measurable end-to-end speedup on this Mac benchmark.
 
+### Bounded deterministic grid parallelism
+
+The default build now decodes independent HEIF grid tiles through Rayon's
+shared worker pool. The first tile remains synchronous and establishes the
+reference metadata. Remaining tiles are processed in windows capped at eight
+workers and a conservative 64 MiB decoded-tile working estimate. Results are
+then validated, converted, and pasted sequentially in row-major order. Builds
+with `parallel-grid` disabled retain the sequential oracle, and
+`decoder-tracing` builds stay sequential so their global trace remains useful.
+
+Alternating five-run release comparisons used the repository's image-adapter
+checksum benchmark, which decodes directly into the same caller-buffer path
+used by the `image` integration without adding PNG encoding time:
+
+| Fixture | Sequential median | Parallel median | Speedup | Reduction |
+|---|---:|---:|---:|---:|
+| 55.9 MP grid panorama | 1.20 s | 0.57 s | 2.11x | 52.5% |
+| Text grid fixture | 0.29 s | 0.13 s | 2.23x | 55.2% |
+
+Every sequential and parallel run returned the same decoded checksum. A
+separate full PNG hash comparison was also byte-identical for both fixtures.
+On one warmed panorama run, peak RSS increased from 250,068,992 bytes to
+282,771,456 bytes (13.1%) while elapsed adapter time fell from 1.18 s to
+0.57 s. The bounded window makes that memory/speed tradeoff explicit.
+
+The final Rayon implementation passed the full differential verifier: 272
+files classified, 219 exact validator comparisons, 219 exact image-hook
+comparisons, and zero failures.
+
 Results for the remaining improvements will be added as they land.
