@@ -35,6 +35,8 @@ use super::residual::{self, ScanOrder};
 use super::sao::SaoMap;
 use super::slice::{IntraPredMode, PartMode, PredMode, SliceHeader};
 use super::transform;
+#[cfg(target_arch = "aarch64")]
+use super::transform_simd::add_residual_block_neon;
 use super::transform_simd::add_residual_block_scalar;
 #[cfg(target_arch = "x86_64")]
 use super::transform_simd::add_residual_block_v3;
@@ -1620,7 +1622,7 @@ impl<'a> SliceContext<'a> {
                     size,
                     max_val
                 ),
-                [v3]
+                [v3, neon]
             );
         } else {
             for py in 0..size {

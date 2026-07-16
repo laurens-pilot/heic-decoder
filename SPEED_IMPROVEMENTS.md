@@ -312,4 +312,42 @@ result is stable across all five pairs. The much larger and consistent RSS
 reduction is the primary result: the decoder no longer keeps the final RGBA
 allocation alive while `image` allocates the replacement RGB buffer.
 
-Results for the NEON improvement will be added when it lands.
+### Exact ARM NEON kernels
+
+A fresh 1 ms Time Profiler capture used an optimized ARM64 build with debug
+symbols and the 55.9 MP panorama's direct-RGB path. The largest self-sample
+counts were residual parsing (321), CABAC bin decoding (198), YCbCr/RGB work
+(160 combined), scaling-list dequantization (72), 32x32 IDCT (58), 16x16 IDCT
+(27), and residual add/clamp (16). Entropy parsing is the dominant limit but
+is serial and branch-heavy. Scaling-list dequantization and residual add were
+therefore the best bounded SIMD targets; they are measurable hot paths and can
+be expressed compactly with an exact scalar oracle.
+
+The AArch64 build now dispatches through NEON for:
+
+- scaling-list dequantization using i32 coefficient/matrix products widened to
+  i64 before the QP multiply, rounding shift, and saturating narrow;
+- flat dequantization using i32 multiply/round/shift and saturating narrow;
+- residual add using signed saturating addition followed by the exact HEVC
+  bit-depth clamp.
+
+The existing scalar implementation remains the fallback and test oracle.
+Randomized NEON-vs-scalar tests cover 4/8/16/32 blocks, 8/10/12/14/16-bit clamp
+ranges, extreme residuals, non-contiguous strides, scaling matrices, saturating
+coefficients, and non-vector-length tails. The optimized library also checks
+successfully for the `aarch64-apple-ios` target.
+
+In a follow-up profile, scaling-list dequantization fell from 72 to 30 self
+samples and residual add from 16 to 9. Sample counts across separate captures
+are directional rather than a precise benchmark, so the release A/B used 15
+alternating pairs instead:
+
+| Fixture | Scalar median | NEON median | Median reduction | Scalar average | NEON average |
+|---|---:|---:|---:|---:|---:|
+| 55.9 MP grid panorama | 0.461070 s | 0.455414 s | 1.2% | 0.460800 s | 0.456821 s |
+| Ordinary 8.6 MP HEIC | 0.117213 s | 0.115700 s | 1.3% | 0.117346 s | 0.115630 s |
+
+The gain is intentionally modest because CABAC and residual parsing dominate.
+The profile still shows 16x16/32x32 transforms as possible follow-up targets,
+but porting their large AVX2 butterfly implementation would be a substantially
+larger correctness and readability risk for the remaining single-digit share.
