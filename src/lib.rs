@@ -43,6 +43,8 @@ use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Read};
 use std::mem::MaybeUninit;
+#[cfg(feature = "parallel-grid")]
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 
@@ -4203,6 +4205,117 @@ const MAX_GRID_TILE_DECODE_THREADS: usize = 8;
 #[cfg(feature = "parallel-grid")]
 const GRID_TILE_DECODE_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
 
+#[cfg(feature = "parallel-grid")]
+#[derive(Default)]
+struct HeicGridTileStreamMemoryEstimate {
+    normalized_stream_bytes: u64,
+    rbsp_bytes: u64,
+    emulation_prevention_position_bytes: u64,
+    nal_count: u64,
+}
+
+#[cfg(feature = "parallel-grid")]
+impl HeicGridTileStreamMemoryEstimate {
+    fn add_nal(&mut self, nal_unit: &[u8]) -> Result<(), DecodeHeicError> {
+        let nal_size =
+            u32::try_from(nal_unit.len()).map_err(|_| DecodeHeicError::NalUnitTooLarge {
+                nal_size: nal_unit.len(),
+            })?;
+        self.normalized_stream_bytes = self
+            .normalized_stream_bytes
+            .saturating_add(u64::from(nal_size))
+            .saturating_add(4);
+        self.nal_count = self.nal_count.saturating_add(1);
+
+        let Some(rbsp) = nal_unit.get(2..) else {
+            return Ok(());
+        };
+        self.rbsp_bytes = self.rbsp_bytes.saturating_add(rbsp.len() as u64);
+
+        let removed_bytes = count_hevc_emulation_prevention_bytes(rbsp);
+        if removed_bytes > 0 {
+            // `skipped_byte_positions` grows from an empty Vec<u32>. Twice
+            // the populated size plus four elements covers its amortized
+            // growth, including the initial small allocation.
+            let position_capacity = removed_bytes.saturating_mul(2).saturating_add(4);
+            self.emulation_prevention_position_bytes = self
+                .emulation_prevention_position_bytes
+                .saturating_add(position_capacity.saturating_mul(size_of::<u32>() as u64));
+        }
+        Ok(())
+    }
+
+    fn estimated_decoder_bytes(&self) -> u64 {
+        // Stream assembly appends to a growing Vec, so allow up to twice its
+        // populated length. Each parsed NAL then owns an RBSP Vec whose
+        // requested capacity equals the transmitted payload length.
+        let stream_and_rbsp_bytes = self
+            .normalized_stream_bytes
+            .saturating_mul(2)
+            .saturating_add(self.rbsp_bytes);
+        let backend_nal_metadata_bytes = conservative_vec_storage_bytes(
+            self.nal_count,
+            size_of::<heic_decoder::hevc::bitstream::NalUnit<'static>>(),
+        );
+        let length_prefixed_nal_metadata_bytes = conservative_vec_storage_bytes(
+            self.nal_count,
+            size_of::<LengthPrefixedHevcNalUnit<'static>>(),
+        );
+
+        stream_and_rbsp_bytes
+            .saturating_add(self.emulation_prevention_position_bytes)
+            .saturating_add(backend_nal_metadata_bytes)
+            .saturating_add(length_prefixed_nal_metadata_bytes)
+    }
+}
+
+#[cfg(feature = "parallel-grid")]
+fn conservative_vec_storage_bytes(element_count: u64, element_size: usize) -> u64 {
+    if element_count == 0 {
+        return 0;
+    }
+    element_count
+        .saturating_mul(2)
+        .saturating_add(4)
+        .saturating_mul(element_size as u64)
+}
+
+#[cfg(feature = "parallel-grid")]
+fn count_hevc_emulation_prevention_bytes(bytes: &[u8]) -> u64 {
+    let mut count = 0_u64;
+    let mut cursor = 0_usize;
+    while cursor < bytes.len() {
+        if cursor + 2 < bytes.len()
+            && bytes[cursor] == 0
+            && bytes[cursor + 1] == 0
+            && bytes[cursor + 2] == 3
+        {
+            count = count.saturating_add(1);
+            cursor += 3;
+        } else {
+            cursor += 1;
+        }
+    }
+    count
+}
+
+#[cfg(feature = "parallel-grid")]
+fn estimate_heic_grid_sps_decode_bytes(
+    sps: &heic_decoder::hevc::params::Sps,
+) -> Result<u64, DecodeHeicError> {
+    let _ = hevc_metadata_from_sps(sps)?;
+    let allocation_layout = heic_layout_from_sps_chroma_array_type(sps.chroma_format_idc)?;
+    let working_bytes_per_pixel = match allocation_layout {
+        HeicPixelLayout::Yuv400 => 4_u64,
+        HeicPixelLayout::Yuv420 => 6,
+        HeicPixelLayout::Yuv422 => 8,
+        HeicPixelLayout::Yuv444 => 12,
+    };
+    Ok(u64::from(sps.pic_width_in_luma_samples)
+        .saturating_mul(u64::from(sps.pic_height_in_luma_samples))
+        .saturating_mul(working_bytes_per_pixel))
+}
+
 /// Estimate the normalized decoder stream plus retained YUV output and decoder
 /// working storage for one tile. Raw SPS geometry is deliberately used here:
 /// a tile-level clean aperture may make the final tile small, but the decoder
@@ -4211,52 +4324,30 @@ const GRID_TILE_DECODE_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
 fn estimate_heic_grid_tile_decode_bytes(
     tile: &isobmff::HeicGridTileItemData,
 ) -> Result<u64, DecodeHeicError> {
-    let sps = decode_hevc_sps_from_hvcc_or_payload(&tile.hvcc, &tile.payload)?;
-    // Keep the normal metadata validation in the preflight path so malformed
-    // conformance windows and unsupported layouts remain sequential.
-    let _ = hevc_metadata_from_sps(&sps)?;
-    let allocation_layout = heic_layout_from_sps_chroma_array_type(sps.chroma_format_idc)?;
-    let working_bytes_per_pixel = match allocation_layout {
-        HeicPixelLayout::Yuv400 => 4_u64,
-        HeicPixelLayout::Yuv420 => 6,
-        HeicPixelLayout::Yuv422 => 8,
-        HeicPixelLayout::Yuv444 => 12,
-    };
-    let decoded_bytes = u64::from(sps.pic_width_in_luma_samples)
-        .saturating_mul(u64::from(sps.pic_height_in_luma_samples))
-        .saturating_mul(working_bytes_per_pixel);
-
-    let mut stream_bytes = 0_u64;
-    for nal_array in &tile.hvcc.nal_arrays {
-        for nal_unit in &nal_array.nal_units {
-            let nal_size =
-                u32::try_from(nal_unit.len()).map_err(|_| DecodeHeicError::NalUnitTooLarge {
-                    nal_size: nal_unit.len(),
-                })?;
-            stream_bytes = stream_bytes
-                .saturating_add(u64::from(nal_size))
-                .saturating_add(4);
+    // The backend currently retains the last SPS it parses. Use the largest
+    // allocation advertised by any SPS instead: this remains safe for files
+    // carrying unused or in-stream replacement parameter sets and avoids
+    // coupling the memory bound to the backend's SPS-selection details.
+    let mut decoded_bytes = None::<u64>;
+    let mut stream_memory = HeicGridTileStreamMemoryEstimate::default();
+    walk_hevc_nals_from_hvcc_or_payload(&tile.hvcc, &tile.payload, |offset, nal_unit| {
+        stream_memory.add_nal(nal_unit)?;
+        let unit = LengthPrefixedHevcNalUnit {
+            offset,
+            bytes: nal_unit,
+        };
+        if unit.nal_unit_type() == Some(NALUnitType::SpsNut) {
+            let sps = hevc_sps_from_nal(nal_unit, offset)?;
+            let candidate_bytes = estimate_heic_grid_sps_decode_bytes(&sps)?;
+            decoded_bytes = Some(decoded_bytes.unwrap_or_default().max(candidate_bytes));
         }
-    }
-    walk_length_prefixed_payload_nals(
-        &tile.payload,
-        usize::from(tile.hvcc.nal_length_size),
-        |_, nal_unit| {
-            let nal_size =
-                u32::try_from(nal_unit.len()).map_err(|_| DecodeHeicError::NalUnitTooLarge {
-                    nal_size: nal_unit.len(),
-                })?;
-            stream_bytes = stream_bytes
-                .saturating_add(u64::from(nal_size))
-                .saturating_add(4);
-            Ok(false)
-        },
-    )?;
+        Ok(false)
+    })?;
 
-    // Stream assembly owns the normalized bytes while the decoder's parsed
-    // NAL units own a second, emulation-prevention-stripped RBSP copy.
-    let decoder_stream_bytes = stream_bytes.saturating_mul(2);
-    Ok(decoded_bytes.saturating_add(decoder_stream_bytes).max(1))
+    let decoded_bytes = decoded_bytes.ok_or(DecodeHeicError::MissingSpsNalUnit)?;
+    Ok(decoded_bytes
+        .saturating_add(stream_memory.estimated_decoder_bytes())
+        .max(1))
 }
 
 /// Choose a conservative number of simultaneously decoded tiles from each
@@ -6831,7 +6922,7 @@ fn hevc_metadata_from_sps(
 /// when the arrays carry no SPS (`hev1` items may keep parameter sets only
 /// in-stream). Selection matches the assembled-stream scan: first NAL whose
 /// own header says SPS, in hvcC array order.
-#[cfg(any(feature = "image-integration", feature = "parallel-grid"))]
+#[cfg(feature = "image-integration")]
 fn hevc_sps_from_hvcc_nal_arrays(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
 ) -> Result<Option<heic_decoder::hevc::params::Sps>, DecodeHeicError> {
@@ -6850,6 +6941,28 @@ fn hevc_sps_from_hvcc_nal_arrays(
     Ok(None)
 }
 
+/// Visit hvcC and in-stream NAL units in the same order used to assemble the
+/// decoder stream. Returning `true` stops the walk after the current unit.
+#[cfg(feature = "parallel-grid")]
+fn walk_hevc_nals_from_hvcc_or_payload(
+    hvcc: &isobmff::HevcDecoderConfigurationBox,
+    payload: &[u8],
+    mut visit: impl FnMut(usize, &[u8]) -> Result<bool, DecodeHeicError>,
+) -> Result<(), DecodeHeicError> {
+    let nal_length_size = hvcc.nal_length_size;
+    if !(1..=4).contains(&nal_length_size) {
+        return Err(DecodeHeicError::InvalidNalLengthSize { nal_length_size });
+    }
+    for nal_array in &hvcc.nal_arrays {
+        for nal_unit in &nal_array.nal_units {
+            if visit(0, nal_unit)? {
+                return Ok(());
+            }
+        }
+    }
+    walk_length_prefixed_payload_nals(payload, usize::from(nal_length_size), visit)
+}
+
 #[cfg(feature = "image-integration")]
 fn hevc_metadata_from_hvcc_nal_arrays(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
@@ -6863,7 +6976,7 @@ fn hevc_metadata_from_hvcc_nal_arrays(
 /// parameter-set arrays, then scan the item payload's length-prefixed NAL
 /// units in place. This visits NAL units in the same order as assembling the
 /// stream and scanning it, but copies no payload bytes.
-#[cfg(any(feature = "image-integration", feature = "parallel-grid"))]
+#[cfg(feature = "image-integration")]
 fn decode_hevc_sps_from_hvcc_or_payload(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
     payload: &[u8],
@@ -13120,15 +13233,97 @@ mod tests {
             payload: Vec::new(),
         };
 
-        let sps = super::decode_hevc_sps_from_hvcc_or_payload(&tile.hvcc, &tile.payload)
-            .expect("SPS should parse");
+        let sps = super::hevc_sps_from_nal(&sps_nal, 0).expect("SPS should parse");
         let metadata = super::hevc_metadata_from_sps(&sps).expect("SPS metadata should parse");
         assert_eq!((metadata.width, metadata.height), (126, 126));
 
-        let normalized_stream_bytes = sps_nal.len() as u64 + 4;
+        let decoded_bytes = super::estimate_heic_grid_sps_decode_bytes(&sps)
+            .expect("SPS allocation estimate should parse");
+        let mut stream_memory = super::HeicGridTileStreamMemoryEstimate::default();
+        stream_memory
+            .add_nal(&sps_nal)
+            .expect("SPS stream estimate should fit");
         assert_eq!(
             super::estimate_heic_grid_tile_decode_bytes(&tile).expect("tile estimate should parse"),
-            128 * 128 * 6 + normalized_stream_bytes * 2,
+            decoded_bytes + stream_memory.estimated_decoder_bytes(),
+        );
+        assert_eq!(decoded_bytes, 128 * 128 * 6);
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    #[test]
+    fn grid_parallel_estimate_uses_largest_sps_across_hvcc_and_payload() {
+        use super::isobmff::{HeicGridTileItemData, HevcNalArray};
+
+        let small_sps = vec![
+            0x42, 0x01, 0x01, 0x03, 0x70, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x1e, 0xa0, 0x20, 0x81, 0x05, 0x96, 0xea, 0xae, 0x9a, 0xe6, 0xe0,
+            0x21, 0xa0, 0xc0, 0x80, 0x00, 0x00, 0x0c, 0x80, 0x00, 0x00, 0x03, 0x00, 0x84,
+        ];
+        let large_sps = vec![
+            0x42, 0x01, 0x01, 0x03, 0x70, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x78, 0xa0, 0x07, 0xd2, 0x00, 0x53, 0x9f, 0x59, 0x6e, 0xa4, 0x92,
+            0x9a, 0xe6, 0xe0, 0x21, 0xa0, 0xc0, 0x80, 0x00, 0x00, 0x0c, 0x80, 0x00, 0x00, 0x03,
+            0x00, 0x84,
+        ];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(large_sps.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&large_sps);
+        let tile = HeicGridTileItemData {
+            item_id: 1,
+            construction_method: 0,
+            hvcc: test_hvcc(
+                vec![HevcNalArray {
+                    array_completeness: true,
+                    nal_unit_type: 33,
+                    nal_units: vec![small_sps.clone()],
+                }],
+                4,
+            ),
+            colr: Default::default(),
+            transforms: Vec::new(),
+            payload,
+        };
+
+        let small = super::hevc_sps_from_nal(&small_sps, 0).expect("small SPS should parse");
+        let large = super::hevc_sps_from_nal(&large_sps, 0).expect("large SPS should parse");
+        let small_bytes = super::estimate_heic_grid_sps_decode_bytes(&small)
+            .expect("small SPS estimate should parse");
+        let large_bytes = super::estimate_heic_grid_sps_decode_bytes(&large)
+            .expect("large SPS estimate should parse");
+        assert!(large_bytes > small_bytes);
+
+        let mut stream_memory = super::HeicGridTileStreamMemoryEstimate::default();
+        stream_memory
+            .add_nal(&small_sps)
+            .expect("small SPS stream estimate should fit");
+        stream_memory
+            .add_nal(&large_sps)
+            .expect("large SPS stream estimate should fit");
+        assert_eq!(
+            super::estimate_heic_grid_tile_decode_bytes(&tile).expect("tile estimate should parse"),
+            large_bytes + stream_memory.estimated_decoder_bytes(),
+        );
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    #[test]
+    fn grid_parallel_stream_estimate_counts_epb_positions_and_nal_metadata() {
+        let nal = [
+            0x4e, 0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x03, 0x02,
+        ];
+        let mut stream_memory = super::HeicGridTileStreamMemoryEstimate::default();
+        stream_memory
+            .add_nal(&nal)
+            .expect("NAL stream estimate should fit");
+
+        assert_eq!(stream_memory.normalized_stream_bytes, nal.len() as u64 + 4);
+        assert_eq!(stream_memory.rbsp_bytes, nal.len() as u64 - 2);
+        assert_eq!(stream_memory.emulation_prevention_position_bytes, 40);
+        assert!(
+            stream_memory.estimated_decoder_bytes()
+                > stream_memory.normalized_stream_bytes * 2 + stream_memory.rbsp_bytes,
+            "parsed-NAL metadata and EPB positions must add memory beyond the stream and RBSP copies"
         );
     }
 
