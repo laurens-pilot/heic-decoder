@@ -1,6 +1,6 @@
-use heic_decoder::image_integration::register_image_decoder_hooks;
-use heic_decoder::{DecodedRgbaPixels, decode_path_to_rgba};
-use image::{DynamicImage, ImageReader};
+use heic_decoder::image_integration::register_image_decoder_hooks_with_guardrails;
+use heic_decoder::{DecodeGuardrails, DecodedRgbaPixels, decode_path_to_rgba};
+use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -75,9 +75,21 @@ fn bench_direct(input_path: &Path) -> Result<u64, Box<dyn Error>> {
 }
 
 fn bench_adapter(input_path: &Path) -> Result<u64, Box<dyn Error>> {
-    let _ = register_image_decoder_hooks();
+    let _ = register_image_decoder_hooks_with_guardrails(DecodeGuardrails {
+        max_input_bytes: Some(128 * 1024 * 1024),
+        max_pixels: Some(256_000_000),
+        max_temp_spool_bytes: Some(256 * 1024 * 1024),
+        temp_spool_directory: None,
+    });
 
-    let decoded = ImageReader::open(input_path)?.decode()?;
+    let mut decoder = ImageReader::open(input_path)?
+        .with_guessed_format()?
+        .into_decoder()?;
+    let _icc_profile = decoder.icc_profile()?;
+    let mut limits = Limits::default();
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+    let decoded = DynamicImage::from_decoder(decoder)?;
     let (width, height) = (decoded.width(), decoded.height());
     let checksum = match decoded {
         DynamicImage::ImageRgba8(buffer) => small_checksum(buffer.as_raw()),

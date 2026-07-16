@@ -1,6 +1,7 @@
 # Local test artifacts
 .heic-test-assets/
 .heic-test-runs/
+.heic-autoresearch/
 
 # Rust build artifacts
 /target/
