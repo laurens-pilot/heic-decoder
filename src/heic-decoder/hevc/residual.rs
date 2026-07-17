@@ -301,8 +301,12 @@ pub fn decode_residual(
         // Middle sub-blocks need coded_sub_block_flag decoded
         // First (i=0) and last sub-blocks are always considered coded
         let (sb_coded, infer_sb_dc_sig) = if sb_idx > 0 && sb_idx < last_sb_idx {
-            // Use proper context derivation with neighbor info
-            let coded = decode_coded_sub_block_flag(cabac, ctx, c_idx, csbf_neighbors)?;
+            // Context offset: 0-1 for luma, 2-3 for chroma. Hoist this
+            // directly into the sub-block loop so the hot CABAC call does not
+            // carry an infallible Result/helper layer.
+            let csbf_ctx = usize::from(csbf_neighbors != 0);
+            let ctx_idx = context::CODED_SUB_BLOCK_FLAG + csbf_ctx + if c_idx > 0 { 2 } else { 0 };
+            let coded = cabac.decode_bin(&mut ctx[ctx_idx]) != 0;
             // If sub-block is coded, we may need to infer DC later
             (coded, coded)
         } else {
@@ -330,21 +334,50 @@ pub fn decode_residual(
             15
         };
 
-        // Significance is decoded in reverse scan order. Keep the significant
-        // positions and their levels dense in that same order so every later
-        // stage visits only coefficients that exist.
-        let mut coeff_positions = [0u8; 16];
-        let mut coeff_values = [1i16; 16];
-        let mut num_coeffs = 0usize;
+        // Significance is decoded in reverse scan order. Append raster indices
+        // directly to the persistent sparse list in that same order; it then
+        // doubles as the dense level/sign worklist for this sub-block.
+        let subblock_start = num_nonzero;
+        let size = size as usize;
+        let sb_offset = sb_y as usize * 4 * size + sb_x as usize * 4;
+        let mut first_sig_pos = 0u8;
+        let mut last_sig_pos = 0u8;
         let mut can_infer_dc = infer_sb_dc_sig;
+
+        // For all transforms larger than 4x4, only the compact local-position
+        // contribution varies per significance bin. The component, transform,
+        // scan, and sub-block contributions are invariant here.
+        let sig_ctx_base = if log2_size == 2 {
+            context::SIG_COEFF_FLAG + if c_idx > 0 { 27 } else { 0 }
+        } else {
+            let mut base = context::SIG_COEFF_FLAG + if c_idx > 0 { 27 } else { 0 };
+            if c_idx == 0 {
+                if sb_x + sb_y > 0 {
+                    base += 3;
+                }
+                base += if log2_size == 3 {
+                    if scan_idx == 0 { 9 } else { 15 }
+                } else {
+                    21
+                };
+            } else {
+                base += if log2_size == 3 { 9 } else { 12 };
+            }
+            base
+        };
 
         // Determine the last position to check
         // For last sub-block: start from last_pos_in_sb (the known last significant coeff)
         // For other sub-blocks: start from position 15
         let last_coeff = if sb_idx == last_sb_idx {
             // Set the known last significant coefficient (no need to decode sig_coeff_flag)
-            coeff_positions[0] = start_pos;
-            num_coeffs = 1;
+            let (px, py) = scan_pos[start_pos as usize];
+            let dst_idx = sb_offset + py as usize * size + px as usize;
+            coeffs[dst_idx] = 1;
+            touched_coeffs[num_nonzero] = dst_idx as u16;
+            num_nonzero += 1;
+            first_sig_pos = start_pos;
+            last_sig_pos = start_pos;
             can_infer_dc = false; // Can't infer DC if we have other coeffs
             // Then check positions from start_pos-1 down to 1
             start_pos.saturating_sub(1)
@@ -356,17 +389,19 @@ pub fn decode_residual(
         // Decode significant_coeff_flags for positions last_coeff down to 1
         // (DC at position 0 is handled separately for inference)
         for n in (1..=last_coeff).rev() {
-            let sig = decode_sig_coeff_flag(
-                cabac, ctx, c_idx, n, log2_size, scan_idx, sb_x, sb_y, prev_csbf, scan_pos,
-            )?;
+            let (x_in_sb, y_in_sb) = scan_pos[n as usize];
+            let raster_pos = y_in_sb as usize * 4 + x_in_sb as usize;
+            let ctx_idx = if log2_size == 2 {
+                sig_ctx_base + CTX_IDX_MAP_4X4[raster_pos] as usize
+            } else {
+                sig_ctx_base + SIG_CTX_LOCAL[prev_csbf as usize][raster_pos] as usize
+            };
+            let sig = cabac.decode_bin(&mut ctx[ctx_idx]) != 0;
             if rc_trace {
                 let (range, _, _) = cabac.get_state_extended();
                 let (byte_pos, _, _) = cabac.get_position();
-                let (x_in_sb, y_in_sb) = scan_pos[n as usize];
                 let xc = sb_x * 4 + x_in_sb;
                 let yc = sb_y * 4 + y_in_sb;
-                let ctx_idx =
-                    calc_sig_coeff_flag_ctx(xc, yc, log2_size, c_idx, scan_idx, prev_csbf);
                 rc_eprintln!(
                     "{rcp}_SIG n={} pos=({},{}) ctx={} val={} range={} byte={}",
                     n,
@@ -379,8 +414,14 @@ pub fn decode_residual(
                 );
             }
             if sig {
-                coeff_positions[num_coeffs] = n;
-                num_coeffs += 1;
+                let dst_idx = sb_offset + y_in_sb as usize * size + x_in_sb as usize;
+                coeffs[dst_idx] = 1;
+                touched_coeffs[num_nonzero] = dst_idx as u16;
+                num_nonzero += 1;
+                if num_nonzero == subblock_start + 1 {
+                    last_sig_pos = n;
+                }
+                first_sig_pos = n;
                 can_infer_dc = false; // Found a coefficient, can't infer DC
             }
         }
@@ -390,26 +431,29 @@ pub fn decode_residual(
         // DC is inferred to be significant (otherwise the sub-block would be all zeros)
         if start_pos > 0 {
             if can_infer_dc {
-                coeff_positions[num_coeffs] = 0;
-                num_coeffs += 1;
+                let dst_idx = sb_offset;
+                coeffs[dst_idx] = 1;
+                touched_coeffs[num_nonzero] = dst_idx as u16;
+                num_nonzero += 1;
+                if num_nonzero == subblock_start + 1 {
+                    last_sig_pos = 0;
+                }
+                first_sig_pos = 0;
                 if rc_trace {
                     rc_eprintln!("{rcp}_SIG n=0 DC_INFERRED");
                 }
             } else {
-                let sig = decode_sig_coeff_flag(
-                    cabac, ctx, c_idx, 0, log2_size, scan_idx, sb_x, sb_y, prev_csbf, scan_pos,
-                )?;
+                let ctx_idx = if log2_size == 2 {
+                    sig_ctx_base + CTX_IDX_MAP_4X4[0] as usize
+                } else if sb_x == 0 && sb_y == 0 {
+                    context::SIG_COEFF_FLAG + if c_idx > 0 { 27 } else { 0 }
+                } else {
+                    sig_ctx_base + SIG_CTX_LOCAL[prev_csbf as usize][0] as usize
+                };
+                let sig = cabac.decode_bin(&mut ctx[ctx_idx]) != 0;
                 if rc_trace {
                     let (range, _, _) = cabac.get_state_extended();
                     let (byte_pos, _, _) = cabac.get_position();
-                    let ctx_idx = calc_sig_coeff_flag_ctx(
-                        sb_x * 4,
-                        sb_y * 4,
-                        log2_size,
-                        c_idx,
-                        scan_idx,
-                        prev_csbf,
-                    );
                     rc_eprintln!(
                         "{rcp}_SIG n=0 pos=({},{}) ctx={} val={} range={} byte={}",
                         sb_x * 4,
@@ -421,12 +465,19 @@ pub fn decode_residual(
                     );
                 }
                 if sig {
-                    coeff_positions[num_coeffs] = 0;
-                    num_coeffs += 1;
+                    let dst_idx = sb_offset;
+                    coeffs[dst_idx] = 1;
+                    touched_coeffs[num_nonzero] = dst_idx as u16;
+                    num_nonzero += 1;
+                    if num_nonzero == subblock_start + 1 {
+                        last_sig_pos = 0;
+                    }
+                    first_sig_pos = 0;
                 }
             }
         }
 
+        let num_coeffs = num_nonzero - subblock_start;
         if num_coeffs == 0 {
             continue;
         }
@@ -462,7 +513,10 @@ pub fn decode_residual(
         // Track dense coefficient indices that need remaining level decoding.
         let mut needs_remaining = 0u16;
 
-        for (coeff_idx, coeff_value) in coeff_values[..num_coeffs].iter_mut().enumerate() {
+        let g1_ctx_base = context::COEFF_ABS_LEVEL_GREATER1_FLAG
+            + if c_idx > 0 { 16 } else { 0 }
+            + (ctx_set as usize) * 4;
+        for coeff_idx in 0..num_coeffs {
             if coeff_idx >= max_g1 {
                 // Beyond first 8: base=1, always needs remaining for values > 1
                 needs_remaining |= 1u16 << coeff_idx;
@@ -481,7 +535,8 @@ pub fn decode_residual(
             }
 
             // Use ctx_set (captured at subblock start) for ALL greater1_flags
-            let g1 = decode_coeff_greater1_flag(cabac, ctx, c_idx, ctx_set, greater1_ctx)?;
+            let ctx_idx = g1_ctx_base + (greater1_ctx as usize).min(3);
+            let g1 = cabac.decode_bin(&mut ctx[ctx_idx]) != 0;
             if rc_trace {
                 let (range, _, _) = cabac.get_state_extended();
                 let (byte_pos, _, _) = cabac.get_position();
@@ -503,7 +558,8 @@ pub fn decode_residual(
             last_greater1_flag = g1;
 
             if g1 {
-                *coeff_value = 2;
+                let dst_idx = touched_coeffs[subblock_start + coeff_idx] as usize;
+                coeffs[dst_idx] = 2;
                 this_subblock_had_gt1 = true; // Track for next subblock's ctx_set
                 if first_g1_idx.is_none() {
                     first_g1_idx = Some(coeff_idx);
@@ -517,7 +573,10 @@ pub fn decode_residual(
         // Decode greater-2 flag (only for first coefficient with greater-1)
         // Uses same ctx_set as greater1_flags (captured at subblock start)
         if let Some(g1_idx) = first_g1_idx {
-            let g2 = decode_coeff_greater2_flag(cabac, ctx, c_idx, ctx_set)?;
+            let ctx_idx = context::COEFF_ABS_LEVEL_GREATER2_FLAG
+                + if c_idx > 0 { 4 } else { 0 }
+                + ctx_set as usize;
+            let g2 = cabac.decode_bin(&mut ctx[ctx_idx]) != 0;
             if rc_trace {
                 let (range, _, _) = cabac.get_state_extended();
                 let (byte_pos, _, _) = cabac.get_position();
@@ -530,15 +589,11 @@ pub fn decode_residual(
                 );
             }
             if g2 {
-                coeff_values[g1_idx] = 3;
+                let dst_idx = touched_coeffs[subblock_start + g1_idx] as usize;
+                coeffs[dst_idx] = 3;
                 needs_remaining |= 1u16 << g1_idx;
             }
         }
-
-        // Dense positions are ordered from the last to the first coefficient
-        // in scan order.
-        let first_sig_pos = coeff_positions[num_coeffs - 1];
-        let last_sig_pos = coeff_positions[0];
 
         // Determine if sign is hidden for this sub-block
         // Per H.265 9.3.4.3: sign is hidden if:
@@ -589,14 +644,22 @@ pub fn decode_residual(
         while remaining_flags != 0 {
             let coeff_idx = remaining_flags.trailing_zeros() as usize;
             remaining_flags &= remaining_flags - 1;
-            let base = coeff_values[coeff_idx];
+            let dst_idx = touched_coeffs[subblock_start + coeff_idx] as usize;
+            let base = coeffs[dst_idx];
             let (remaining, new_rice) = decode_coeff_abs_level_remaining(cabac, rice_param, base)?;
             if rc_trace {
                 let (range, _, _) = cabac.get_state_extended();
                 let (byte_pos, _, _) = cabac.get_position();
+                let raster_x = dst_idx % size;
+                let raster_y = dst_idx / size;
+                let n = find_scan_pos_4x4(
+                    scan_pos,
+                    (raster_x - sb_x as usize * 4) as u8,
+                    (raster_y - sb_y as usize * 4) as u8,
+                );
                 rc_eprintln!(
                     "{rcp}_REM n={} base={} rice={} rem={} final={} range={} byte={}",
-                    coeff_positions[coeff_idx],
+                    n,
                     base,
                     rice_param,
                     remaining,
@@ -606,14 +669,16 @@ pub fn decode_residual(
                 );
             }
             rice_param = new_rice;
-            coeff_values[coeff_idx] = base + remaining;
+            coeffs[dst_idx] = base + remaining;
         }
 
         // Apply signs and compute sum for parity inference
-        // At this point coeff_values[] are all positive (absolute values)
+        // At this point all workspace values are positive absolute levels.
         let mut sum_abs_level = 0i32;
 
-        for (coeff_idx, coeff_value) in coeff_values[..num_coeffs].iter_mut().enumerate() {
+        for coeff_idx in 0..num_coeffs {
+            let dst_idx = touched_coeffs[subblock_start + coeff_idx] as usize;
+            let coeff_value = &mut coeffs[dst_idx];
             if coeff_idx < num_signs && coeff_signs & (1 << (num_signs - 1 - coeff_idx)) != 0 {
                 *coeff_value = -*coeff_value;
             }
@@ -625,20 +690,10 @@ pub fn decode_residual(
             }
         }
 
-        // Store coefficients in buffer
-        let size = size as usize;
-        let sb_offset = sb_y as usize * 4 * size + sb_x as usize * 4;
-        for coeff_idx in 0..num_coeffs {
-            let n = coeff_positions[coeff_idx] as usize;
-            let (px, py) = scan_pos[n];
-            let dst_idx = sb_offset + py as usize * size + px as usize;
-            coeffs[dst_idx] = coeff_values[coeff_idx];
-            touched_coeffs[num_nonzero] = dst_idx as u16;
-            num_nonzero += 1;
-
+        #[cfg(feature = "decoder-tracing")]
+        for &dst_idx in &touched_coeffs[subblock_start..num_nonzero] {
             // Track large coefficients (indicates CABAC desync)
-            #[cfg(feature = "decoder-tracing")]
-            if coeff_values[coeff_idx].abs() > 500 {
+            if coeffs[dst_idx as usize].abs() > 500 {
                 let (byte_pos, _, _) = cabac.get_position();
                 debug::track_large_coeff(byte_pos);
             }
@@ -863,189 +918,19 @@ fn decode_last_sig_coeff_prefix(
     Ok(prefix)
 }
 
-/// Decode coded_sub_block_flag
-/// Per H.265 section 9.3.4.2.4, context depends on neighbor coded_sub_block_flags:
-/// - csbfCtx = (csbf_right | csbf_below) ? 1 : 0
-/// - ctx_idx = base + csbfCtx + c_idx_offset
-fn decode_coded_sub_block_flag(
-    cabac: &mut CabacDecoder<'_>,
-    ctx: &mut [ContextModel],
-    c_idx: u8,
-    csbf_neighbors: u8, // bit 0 = right, bit 1 = below
-) -> Result<bool> {
-    // Context offset: 0-1 for luma, 2-3 for chroma
-    // csbfCtx = 1 if either neighbor is coded, else 0
-    let csbf_ctx = if csbf_neighbors != 0 { 1 } else { 0 };
-    let ctx_idx = context::CODED_SUB_BLOCK_FLAG + csbf_ctx + if c_idx > 0 { 2 } else { 0 };
-    Ok(cabac.decode_bin(&mut ctx[ctx_idx]) != 0)
-}
-
 /// Context index map for 4x4 TU sig_coeff_flag (H.265 Table 9-41)
 /// Maps position (y*4 + x) to context index
 static CTX_IDX_MAP_4X4: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
 
-/// Calculate sig_coeff_flag context index
-///
-/// Per H.265 section 9.3.4.2.5, the context depends on:
-/// - Position within sub-block (xP, yP)
-/// - Sub-block position within TU (xS, yS)
-/// - coded_sub_block_flag of neighbors (prevCsbf)
-/// - Component (luma/chroma)
-/// - TU size and scan order
-///
-/// Parameters:
-/// - x_c, y_c: coefficient position within TU
-/// - log2_size: TU size (2=4x4, 3=8x8, 4=16x16, 5=32x32)
-/// - c_idx: component (0=Y, 1=Cb, 2=Cr)
-/// - scan_idx: scan order (0=diagonal, 1=horizontal, 2=vertical)
-/// - prev_csbf: coded_sub_block_flag of neighbors (bit0=right, bit1=below per H.265/libde265)
-fn calc_sig_coeff_flag_ctx(
-    x_c: u8,
-    y_c: u8,
-    log2_size: u8,
-    c_idx: u8,
-    scan_idx: u8,
-    prev_csbf: u8,
-) -> usize {
-    let sb_width = 1u8 << (log2_size - 2);
-
-    let sig_ctx = if sb_width == 1 {
-        // 4x4 TU: use lookup table
-        CTX_IDX_MAP_4X4[(y_c as usize * 4 + x_c as usize).min(15)]
-    } else if x_c == 0 && y_c == 0 {
-        // DC coefficient
-        0
-    } else {
-        // Sub-block and position within sub-block
-        let x_s = x_c >> 2;
-        let y_s = y_c >> 2;
-        let x_p = x_c & 3;
-        let y_p = y_c & 3;
-
-        // Base context from position and neighbor flags
-        // Per libde265: prevCsbf bit0=right, bit1=below
-        let mut ctx = match prev_csbf {
-            0 => {
-                // No coded neighbors: context based on position sum
-                if x_p + y_p >= 3 {
-                    0
-                } else if x_p + y_p > 0 {
-                    1
-                } else {
-                    2
-                }
-            }
-            1 => {
-                // Right neighbor coded (bit0=1): context based on y position
-                if y_p == 0 {
-                    2
-                } else if y_p == 1 {
-                    1
-                } else {
-                    0
-                }
-            }
-            2 => {
-                // Below neighbor coded (bit1=1): context based on x position
-                if x_p == 0 {
-                    2
-                } else if x_p == 1 {
-                    1
-                } else {
-                    0
-                }
-            }
-            _ => {
-                // Both neighbors coded
-                2
-            }
-        };
-
-        if c_idx == 0 {
-            // Luma
-            if x_s + y_s > 0 {
-                ctx += 3; // Not first sub-block
-            }
-
-            // Size-dependent offset
-            if sb_width == 2 {
-                // 8x8 TU
-                ctx += if scan_idx == 0 { 9 } else { 15 };
-            } else {
-                // 16x16 or 32x32 TU
-                ctx += 21;
-            }
-        } else {
-            // Chroma
-            if sb_width == 2 {
-                // 8x8 TU
-                ctx += 9;
-            } else {
-                // 16x16 or larger TU
-                ctx += 12;
-            }
-        }
-
-        ctx
-    };
-
-    // Final context index
-    context::SIG_COEFF_FLAG + if c_idx > 0 { 27 } else { 0 } + sig_ctx as usize
-}
-
-/// Decode significant_coeff_flag with proper context derivation
-#[allow(clippy::too_many_arguments)]
-fn decode_sig_coeff_flag(
-    cabac: &mut CabacDecoder<'_>,
-    ctx: &mut [ContextModel],
-    c_idx: u8,
-    pos: u8,
-    log2_size: u8,
-    scan_idx: u8,
-    sb_x: u8,
-    sb_y: u8,
-    prev_csbf: u8,
-    scan_table: &[(u8, u8); 16],
-) -> Result<bool> {
-    // Get coefficient position within TU from scan position
-    let (x_in_sb, y_in_sb) = scan_table[pos as usize];
-    let x_c = sb_x * 4 + x_in_sb;
-    let y_c = sb_y * 4 + y_in_sb;
-
-    let ctx_idx = calc_sig_coeff_flag_ctx(x_c, y_c, log2_size, c_idx, scan_idx, prev_csbf);
-
-    Ok(cabac.decode_bin(&mut ctx[ctx_idx]) != 0)
-}
-
-/// Decode coeff_abs_level_greater1_flag
-/// Per H.265 9.3.4.2.6: context index = ctxSet * 4 + min(greater1Ctx, 3)
-/// Plus 16 for chroma (c_idx > 0)
-fn decode_coeff_greater1_flag(
-    cabac: &mut CabacDecoder<'_>,
-    ctx: &mut [ContextModel],
-    c_idx: u8,
-    ctx_set: u8,
-    greater1_ctx: u8,
-) -> Result<bool> {
-    let ctx_idx = context::COEFF_ABS_LEVEL_GREATER1_FLAG
-        + if c_idx > 0 { 16 } else { 0 }
-        + (ctx_set as usize) * 4
-        + (greater1_ctx as usize).min(3);
-    Ok(cabac.decode_bin(&mut ctx[ctx_idx]) != 0)
-}
-
-/// Decode coeff_abs_level_greater2_flag
-/// Per H.265: context index = ctxSet + (c_idx > 0 ? 4 : 0)
-fn decode_coeff_greater2_flag(
-    cabac: &mut CabacDecoder<'_>,
-    ctx: &mut [ContextModel],
-    c_idx: u8,
-    ctx_set: u8,
-) -> Result<bool> {
-    let ctx_idx =
-        context::COEFF_ABS_LEVEL_GREATER2_FLAG + if c_idx > 0 { 4 } else { 0 } + ctx_set as usize;
-    Ok(cabac.decode_bin(&mut ctx[ctx_idx]) != 0)
-}
+/// Local sig_coeff_flag context contribution for each `prevCsbf` value and
+/// raster position. The component, transform-size, scan, and sub-block terms
+/// are invariant across a sub-block and are added once in `decode_residual`.
+static SIG_CTX_LOCAL: [[u8; 16]; 4] = [
+    [2, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+    [2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+    [2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0],
+    [2; 16],
+];
 
 /// Decode coeff_abs_level_remaining (Golomb-Rice with adaptive rice parameter)
 /// Returns (value, updated_rice_param)
