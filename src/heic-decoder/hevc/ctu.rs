@@ -153,6 +153,10 @@ pub struct SliceContext<'a> {
     pub sao_map: SaoMap,
     /// Reusable residual buffer (inverse transform writes all elements, no re-zeroing needed)
     residual_buf: [i16; 1024],
+    /// Reusable sparse coefficient workspace. Only indices recorded in
+    /// `touched_coeffs` may be non-zero between residual decodes.
+    coeff_buf: [i16; 1024],
+    touched_coeffs: [u16; 1024],
     /// Reusable scaling matrix buffer
     scaling_buf: [u8; 1024],
 }
@@ -291,6 +295,8 @@ impl<'a> SliceContext<'a> {
             current_qg_y: -1,
             sao_map: SaoMap::new(sps.pic_width_in_ctbs(), sps.pic_height_in_ctbs()),
             residual_buf: [0i16; 1024],
+            coeff_buf: [0i16; 1024],
+            touched_coeffs: [0u16; 1024],
             scaling_buf: [16u8; 1024],
         })
     }
@@ -1486,7 +1492,7 @@ impl<'a> SliceContext<'a> {
         frame: &mut DecodedFrame,
     ) -> Result<()> {
         // Decode coefficients via CABAC
-        let (mut coeff_buf, transform_skip) = residual::decode_residual(
+        let (num_nonzero, transform_skip) = residual::decode_residual(
             &mut self.cabac,
             &mut self.ctx,
             log2_size,
@@ -1497,9 +1503,11 @@ impl<'a> SliceContext<'a> {
             self.pps.transform_skip_enabled_flag,
             x0,
             y0,
+            &mut self.coeff_buf,
+            &mut self.touched_coeffs,
         )?;
 
-        if coeff_buf.is_zero() {
+        if num_nonzero == 0 {
             return Ok(());
         }
 
@@ -1517,13 +1525,16 @@ impl<'a> SliceContext<'a> {
         // residual — no scaling, no inverse transform.
         if self.cu_transquant_bypass_flag {
             let residual = &mut self.residual_buf;
-            residual[..num_coeffs].copy_from_slice(&coeff_buf.coeffs[..num_coeffs]);
+            residual[..num_coeffs].copy_from_slice(&self.coeff_buf[..num_coeffs]);
+            for &idx in &self.touched_coeffs[..num_nonzero] {
+                self.coeff_buf[idx as usize] = 0;
+            }
             self.add_residual_to_plane(x0, y0, log2_size, c_idx, bit_depth, frame);
             return Ok(());
         }
 
         // Dequantize coefficients in-place
-        let coeffs = &mut coeff_buf.coeffs;
+        let coeffs = &mut self.coeff_buf;
 
         let dequant_params = transform::DequantParams {
             qp,
@@ -1588,6 +1599,12 @@ impl<'a> SliceContext<'a> {
         } else {
             let is_intra_4x4_luma = log2_size == 2 && c_idx == 0;
             transform::inverse_transform(coeffs, residual, size, bit_depth, is_intra_4x4_luma);
+        }
+
+        // Dequantization only changes non-zero inputs, so the dense list from
+        // residual parsing is sufficient to restore the workspace invariant.
+        for &idx in &self.touched_coeffs[..num_nonzero] {
+            coeffs[idx as usize] = 0;
         }
 
         self.add_residual_to_plane(x0, y0, log2_size, c_idx, bit_depth, frame);

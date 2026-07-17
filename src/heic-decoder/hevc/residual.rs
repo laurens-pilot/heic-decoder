@@ -133,68 +133,6 @@ pub fn get_scan_4x4(order: ScanOrder) -> &'static [(u8, u8); 16] {
     }
 }
 
-/// Coefficient buffer for a transform unit
-#[derive(Clone)]
-pub struct CoeffBuffer {
-    /// Coefficients for this TU
-    pub coeffs: [i16; MAX_COEFF],
-    /// Transform size (log2)
-    pub log2_size: u8,
-    /// Number of non-zero coefficients
-    pub num_nonzero: u16,
-}
-
-impl Default for CoeffBuffer {
-    fn default() -> Self {
-        Self {
-            coeffs: [0; MAX_COEFF],
-            log2_size: 2,
-            num_nonzero: 0,
-        }
-    }
-}
-
-impl CoeffBuffer {
-    /// Create a new coefficient buffer
-    #[inline]
-    pub fn new(log2_size: u8) -> Self {
-        Self {
-            coeffs: [0; MAX_COEFF],
-            log2_size,
-            num_nonzero: 0,
-        }
-    }
-
-    /// Get the transform size
-    #[inline]
-    pub fn size(&self) -> usize {
-        1 << self.log2_size
-    }
-
-    /// Get coefficient at position
-    #[allow(dead_code)]
-    #[inline]
-    pub fn get(&self, x: usize, y: usize) -> i16 {
-        let stride = self.size();
-        self.coeffs[y * stride + x]
-    }
-
-    /// Set coefficient at position
-    #[inline]
-    pub fn set(&mut self, x: usize, y: usize, value: i16) {
-        let stride = self.size();
-        self.coeffs[y * stride + x] = value;
-        if value != 0 {
-            self.num_nonzero = self.num_nonzero.saturating_add(1);
-        }
-    }
-
-    /// Check if all coefficients are zero
-    pub fn is_zero(&self) -> bool {
-        self.num_nonzero == 0
-    }
-}
-
 /// Decode residual coefficients for a transform unit
 /// Debug counter to identify specific TU calls
 #[cfg(feature = "decoder-tracing")]
@@ -213,7 +151,9 @@ pub fn decode_residual(
     transform_skip_enabled: bool,
     _x0: u32,
     _y0: u32,
-) -> Result<(CoeffBuffer, bool)> {
+    coeffs: &mut [i16; MAX_COEFF],
+    touched_coeffs: &mut [u16; MAX_COEFF],
+) -> Result<(usize, bool)> {
     #[cfg(feature = "decoder-tracing")]
     DEBUG_RESIDUAL_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
@@ -240,8 +180,8 @@ pub fn decode_residual(
     let rc_trace = false;
     let rcp = "RCX";
 
-    let mut buffer = CoeffBuffer::new(log2_size);
     let size = 1u32 << log2_size;
+    let mut num_nonzero = 0usize;
 
     // Decode transform_skip_flag (H.265 7.3.8.11)
     // Per spec: if transform_skip_enabled_flag && !cu_transquant_bypass_flag
@@ -691,7 +631,10 @@ pub fn decode_residual(
         for coeff_idx in 0..num_coeffs {
             let n = coeff_positions[coeff_idx] as usize;
             let (px, py) = scan_pos[n];
-            buffer.coeffs[sb_offset + py as usize * size + px as usize] = coeff_values[coeff_idx];
+            let dst_idx = sb_offset + py as usize * size + px as usize;
+            coeffs[dst_idx] = coeff_values[coeff_idx];
+            touched_coeffs[num_nonzero] = dst_idx as u16;
+            num_nonzero += 1;
 
             // Track large coefficients (indicates CABAC desync)
             #[cfg(feature = "decoder-tracing")]
@@ -700,8 +643,6 @@ pub fn decode_residual(
                 debug::track_large_coeff(byte_pos);
             }
         }
-        buffer.num_nonzero += num_coeffs as u16;
-
         // Update prev_subblock_had_gt1 for the next subblock (lower scan index)
         prev_subblock_had_gt1 = this_subblock_had_gt1;
     }
@@ -711,7 +652,7 @@ pub fn decode_residual(
         let (byte_pos, _, _) = cabac.get_position();
         rc_eprintln!("{rcp}_END range={} byte={}", range, byte_pos);
     }
-    Ok((buffer, transform_skip))
+    Ok((num_nonzero, transform_skip))
 }
 
 /// Get sub-block scan order
