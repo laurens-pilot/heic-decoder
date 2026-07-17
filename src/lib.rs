@@ -8285,6 +8285,12 @@ fn decode_avif_bytes_to_rgba_layout(
 trait RgbaSampleOutput<T: Copy> {
     fn sample_len(&self) -> usize;
     fn write_sample(&mut self, index: usize, sample: T);
+
+    fn write_samples(&mut self, index: usize, samples: &[T]) {
+        for (offset, &sample) in samples.iter().enumerate() {
+            self.write_sample(index + offset, sample);
+        }
+    }
 }
 
 #[cfg(feature = "image-integration")]
@@ -8298,6 +8304,10 @@ impl<T: Copy> RgbaSampleOutput<T> for SliceRgbaOutput<'_, T> {
 
     fn write_sample(&mut self, index: usize, sample: T) {
         self.0[index] = sample;
+    }
+
+    fn write_samples(&mut self, index: usize, samples: &[T]) {
+        self.0[index..index + samples.len()].copy_from_slice(samples);
     }
 }
 
@@ -8383,6 +8393,26 @@ fn decode_primary_heic_grid_to_rgba_output<T: Copy + Default, O: RgbaSampleOutpu
         grid_data.descriptor.output_height,
         transforms,
     )?;
+    // Orientation-only grids map the complete source canvas bijectively. The
+    // tile paste can therefore advance through the destination with one
+    // affine stride per source row instead of interpreting the transform plan
+    // and rechecking coordinates for every pixel. Clean apertures and alpha
+    // composition retain the generic path below.
+    let direct_orientation = if auxiliary_alpha.is_none()
+        && transforms.iter().all(|transform| {
+            !matches!(
+                transform,
+                isobmff::PrimaryItemTransformProperty::CleanAperture(_)
+            )
+        }) {
+        Some(rgba_orientation_transform_from_primary_transforms(
+            grid_data.descriptor.output_width,
+            grid_data.descriptor.output_height,
+            transforms,
+        )?)
+    } else {
+        None
+    };
     let expected = checked_rgba_sample_count(
         transform_plan.destination_width,
         transform_plan.destination_height,
@@ -8474,6 +8504,7 @@ fn decode_primary_heic_grid_to_rgba_output<T: Copy + Default, O: RgbaSampleOutpu
         out,
         &reference,
         &transform_plan,
+        direct_orientation.as_ref(),
         auxiliary_alpha,
         convert_tile,
         scale_alpha,
@@ -8488,6 +8519,7 @@ fn paste_heic_grid_tiles_to_transformed_rgba_slice<T: Copy, O: RgbaSampleOutput<
     output: &mut O,
     reference: &HeicGridTileReference,
     transform_plan: &RgbaTransformPlan,
+    direct_orientation: Option<&Option<RgbaOrientationTransform>>,
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     convert_tile: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
     scale_alpha: fn(u16, u8) -> T,
@@ -8550,6 +8582,21 @@ fn paste_heic_grid_tiles_to_transformed_rgba_slice<T: Copy, O: RgbaSampleOutput<
                     detail: "grid tile y-origin cannot be represented".to_string(),
                 })?;
 
+            if let Some(orientation) = direct_orientation {
+                return paste_direct_grid_rgba_tile_to_output(
+                    tile_pixels,
+                    tile_width,
+                    tile_height,
+                    output,
+                    source_width,
+                    source_height,
+                    destination_width,
+                    x_origin,
+                    y_origin,
+                    orientation.as_ref(),
+                );
+            }
+
             for tile_y in 0..tile_height {
                 let source_y = y_origin.checked_add(tile_y).ok_or_else(|| {
                     DecodeHeicError::InvalidDecodedFrame {
@@ -8597,6 +8644,83 @@ fn paste_heic_grid_tiles_to_transformed_rgba_slice<T: Copy, O: RgbaSampleOutput<
             Ok(())
         },
     )
+}
+
+/// Paste one already-converted grid tile when the primary transform is only
+/// an orientation (or identity). Such transforms are affine permutations of
+/// the source canvas, so the destination sample stride is constant across a
+/// source row. All geometry and buffer lengths have been validated by the
+/// caller before entering this hot loop.
+#[cfg(feature = "image-integration")]
+#[allow(clippy::too_many_arguments)]
+fn paste_direct_grid_rgba_tile_to_output<T: Copy, O: RgbaSampleOutput<T>>(
+    tile_pixels: &[T],
+    tile_width: usize,
+    tile_height: usize,
+    output: &mut O,
+    source_width: usize,
+    source_height: usize,
+    destination_width: usize,
+    x_origin: usize,
+    y_origin: usize,
+    orientation: Option<&RgbaOrientationTransform>,
+) -> Result<(), DecodeError> {
+    if x_origin >= source_width || y_origin >= source_height {
+        return Ok(());
+    }
+
+    let copy_width = tile_width.min(source_width - x_origin);
+    let copy_height = tile_height.min(source_height - y_origin);
+    let copy_samples = copy_width * 4;
+
+    if orientation.is_none() {
+        debug_assert_eq!(source_width, destination_width);
+        for tile_y in 0..copy_height {
+            let source_sample = tile_y * tile_width * 4;
+            let destination_sample = ((y_origin + tile_y) * destination_width + x_origin) * 4;
+            output.write_samples(
+                destination_sample,
+                &tile_pixels[source_sample..source_sample + copy_samples],
+            );
+        }
+        return Ok(());
+    }
+
+    let orientation = orientation.expect("orientation was checked above");
+    debug_assert_eq!(destination_width, orientation.destination_width_usize);
+    let destination_step = (orientation.destination_y_from_source_x * destination_width as i64
+        + orientation.destination_x_from_source_x)
+        * 4;
+
+    for tile_y in 0..copy_height {
+        let source_y = y_origin + tile_y;
+        let source_sample = tile_y * tile_width * 4;
+        let (destination_x, destination_y) = orientation.map_source_pixel(x_origin, source_y)?;
+        let mut destination_sample =
+            ((destination_y * destination_width + destination_x) * 4) as i64;
+
+        if destination_step == 4 {
+            output.write_samples(
+                destination_sample as usize,
+                &tile_pixels[source_sample..source_sample + copy_samples],
+            );
+            continue;
+        }
+
+        for tile_x in 0..copy_width {
+            let source_sample = source_sample + tile_x * 4;
+            debug_assert!(destination_sample >= 0);
+            let destination_sample_usize = destination_sample as usize;
+            debug_assert!(destination_sample_usize + 4 <= output.sample_len());
+            output.write_samples(
+                destination_sample_usize,
+                &tile_pixels[source_sample..source_sample + 4],
+            );
+            destination_sample += destination_step;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "image-integration")]
