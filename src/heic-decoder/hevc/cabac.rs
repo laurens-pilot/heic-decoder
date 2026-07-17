@@ -242,19 +242,23 @@ impl<'a> CabacDecoder<'a> {
     /// Equivalent to libde265's init_CABAC_decoder_2().
     pub fn reinit(&mut self) {
         self.range = 510;
-        self.bits_needed = 8;
+        // With fewer than two bytes left, the legacy per-bit refill consumed
+        // the available high byte and then normalized bits_needed to -8 on
+        // the first decoded bit. Represent that pending first-bit transition
+        // directly as -9 so batched renormalization remains exactly
+        // equivalent without a special case in its hot path.
+        self.bits_needed = -9;
         self.value = 0;
 
         let remaining = self.data.len() - self.byte_pos;
         if remaining > 0 {
             self.value = (self.data[self.byte_pos] as u32) << 8;
             self.byte_pos += 1;
-            self.bits_needed -= 8;
         }
         if remaining > 1 {
             self.value |= self.data[self.byte_pos] as u32;
             self.byte_pos += 1;
-            self.bits_needed -= 8;
+            self.bits_needed = -8;
         }
     }
 
@@ -375,9 +379,11 @@ impl<'a> CabacDecoder<'a> {
     fn renormalize(&mut self) {
         if self.range < 256 {
             // `range` is non-zero and at most seven shifts are needed. Since
-            // `bits_needed` starts in -8..=-1, the batch crosses at most one
-            // byte boundary. When it does, place the new byte exactly where
-            // the remaining single-bit shifts would have moved it.
+            // `bits_needed` starts in -9..=-1, the batch crosses at most one
+            // byte boundary. (`-9` is the canonical short-reinit state and
+            // cannot cross within a seven-bit batch.) When a normal state
+            // crosses, place the new byte exactly where the remaining
+            // single-bit shifts would have moved it.
             let shift = self.range.leading_zeros() - 23;
             self.range <<= shift;
             self.value <<= shift;
@@ -526,3 +532,79 @@ pub static INIT_VALUES: [u8; context::NUM_CONTEXTS] = [
     154, 154, 154, 154, 154, 154, 154, 154, // RES_SCALE_SIGN_FLAG (2)
     154, 154,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::CabacDecoder;
+
+    fn legacy_reinit(decoder: &mut CabacDecoder<'_>, byte_pos: usize) {
+        decoder.byte_pos = byte_pos;
+        decoder.range = 510;
+        decoder.bits_needed = 8;
+        decoder.value = 0;
+
+        let remaining = decoder.data.len() - decoder.byte_pos;
+        if remaining > 0 {
+            decoder.value = (decoder.data[decoder.byte_pos] as u32) << 8;
+            decoder.byte_pos += 1;
+            decoder.bits_needed -= 8;
+        }
+        if remaining > 1 {
+            decoder.value |= decoder.data[decoder.byte_pos] as u32;
+            decoder.byte_pos += 1;
+            decoder.bits_needed -= 8;
+        }
+    }
+
+    fn legacy_renormalize(decoder: &mut CabacDecoder<'_>) {
+        while decoder.range < 256 {
+            decoder.range <<= 1;
+            decoder.value <<= 1;
+            decoder.bits_needed += 1;
+            if decoder.bits_needed >= 0 {
+                decoder.bits_needed = -8;
+                if decoder.byte_pos < decoder.data.len() {
+                    decoder.value |= decoder.data[decoder.byte_pos] as u32;
+                    decoder.byte_pos += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_renormalization_matches_legacy_after_short_reinit() {
+        let data = [0x12, 0x34, 0x56, 0x78];
+
+        for remaining in 0..=2 {
+            let byte_pos = data.len() - remaining;
+            for range in [128, 64, 32, 16, 8, 4, 2] {
+                let mut batched = CabacDecoder::new(&data).expect("CABAC test data");
+                batched.seek_to(byte_pos).expect("valid byte offset");
+                batched.range = range;
+
+                let mut legacy = CabacDecoder::new(&data).expect("CABAC test data");
+                legacy_reinit(&mut legacy, byte_pos);
+                legacy.range = range;
+
+                batched.renormalize();
+                legacy_renormalize(&mut legacy);
+
+                assert_eq!(
+                    (
+                        batched.range,
+                        batched.value,
+                        batched.bits_needed,
+                        batched.byte_pos,
+                    ),
+                    (
+                        legacy.range,
+                        legacy.value,
+                        legacy.bits_needed,
+                        legacy.byte_pos,
+                    ),
+                    "remaining={remaining}, range={range}"
+                );
+            }
+        }
+    }
+}
