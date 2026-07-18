@@ -177,3 +177,15 @@ Instrumented the decoder temporarily at the actually selected parsed PPS and sli
 No bounded implementation survived the safety/design review. CABAC row substreams are independently seekable, but `decode_ctu` interleaves entropy parsing and intra reconstruction through one full-picture `&mut DecodedFrame`, while `SliceContext` owns shared full-picture CT-depth, intra-mode, QP, deblock, and SAO maps. Correct workers need the prior row's post-CTU-1 context, a two-CTU release/acquire wavefront, published above/above-right samples and map state, disjoint output ownership, SAO merge coordination, and deterministic raster-order error precedence. A whole-frame mutex serializes the work; aliased mutable frames are undefined behavior; per-worker frame clones multiply mobile memory and add full-frame copies. Nested WPP inside 156 already grid-parallel tiles would also oversubscribe mobile CPUs.
 
 The temporary survey code was removed and all 79 all-feature tests passed with a clean tree. With no safe source candidate, a candidate A/B benchmark would be identical to the accepted baseline and was not manufactured. A credible future implementation first needs a CTU-row-owned frame/map abstraction with small immutable published top-border halos and ordered error propagation; deblocking and SAO can remain serial after reconstruction. That prerequisite is a substantial architecture project rather than a reviewable optimization for this experiment, so suggestion 10 was rejected without weakening safety or correctness.
+
+## Final accepted-stack audit (2026-07-18)
+
+Only suggestions 4 (bounded ordered grid-tile streaming) and 6 (expanded AArch64 color-conversion SIMD) were retained. The final branch passed the complete validator gate again after all ten experiments: 272 files accounted for, 219 pixel-oracle cases passed, 219 production image-hook parity checks passed, and zero failures.
+
+Fresh builds of the original pre-experiment source (`7c17018`) and final accepted source were compared through the complete 225-file production `image`-crate hook. Every run produced fingerprint `15185db2471aa39d`:
+
+- Apple Silicon desktop: `1.068302x` (original 1170.242 ms, final 1095.423 ms; +6.83%).
+- Pixel 4 / Android 13: `1.083983x` (original 7266.524 ms, final 6703.542 ms; +8.40%). Both interleaved pairs improved; thermal status was 0 before and after.
+- iPhone 11 Pro / iOS 26.5: the reversed-order confirmation was `1.044781x` (original 2252.898 ms, final 2156.335 ms; +4.48%). Across both four-run orderings the result was `1.056770x` (+5.68%); the phone reached thermal state fair, so the balanced reversed confirmation is the conservative figure.
+
+The final accepted stack is therefore faster on all three targets through the required production hook while preserving full-corpus correctness.
