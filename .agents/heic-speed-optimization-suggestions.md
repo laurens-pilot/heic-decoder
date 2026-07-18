@@ -152,6 +152,18 @@ Grid images now use accepted affine row-stride placement, but non-grid images wi
 
 Fold orientation into the color-conversion write step with blocked (cache-tiled) transpose for 90/270 rotations, writing directly into the caller's buffer, mirroring the approach that already succeeded for grids.
 
+### Experiment result (2026-07-18): rejected
+
+Implemented an orientation-only coded-image hook finalizer that converted source-order 128x32 YUV regions with the existing SIMD kernels, then affine-transposed or mirrored each bounded RGBA tile directly into the caller's output. Scratch was limited to 16 KiB for RGBA8 or 32 KiB for RGBA16. Clean apertures retained the generic path; focused differential tests covered YUV400/420/422/444, full/limited range, 8/10/12-bit storage, alpha, every rotation and mirror, composites, and partial edge tiles. The candidate passed 73 library tests, 8 CLI tests, strict Clippy, portability builds, and the complete validator gate: 272 corpus files accounted for, 219 pixel-oracle cases passed, 219 production image-hook parity checks passed, and zero failures.
+
+A targeted synthetic 3024x4032 8-bit 4:2:0 90-degree production-hook finalizer test was about 6.8x faster (34.27 ms candidate versus 233.32 ms generic for two conversions), confirming that the technique works when exercised. However, a public-parser survey of the fixed 225-file benchmark found 54 coded HEIC primaries and 3 grids: none of the coded primaries had an effective `irot`/`imir`, while the two oriented HEICs were grids already handled by the accepted grid path. The full production-hook A/B therefore measured only noise, with identical fingerprints:
+
+- Apple Silicon desktop: `1.003051x` (baseline 1070.601 ms, candidate 1067.344 ms; +0.31%).
+- Pixel 4 / Android 13: the first B/C/C/B round reported an impossible-for-an-unexercised-path `1.139358x`, but the reversed C/B/B/C confirmation flipped to `0.970632x` (baseline 6786.403 ms, candidate 6991.737 ms; -2.94%). Thermal status was 0 throughout, but the extreme run-to-run frequency variation makes this non-evidence.
+- iPhone 11 Pro / iOS 26.5: `1.006080x` (baseline 2177.539 ms, candidate 2164.380 ms; +0.61%; nominal thermal state throughout).
+
+The implementation was reverted. It is a strong targeted optimization for a workload absent from the agreed corpus, but a 531-line specialized path with no measurable full-hook benefit does not meet this experiment's acceptance rule.
+
 ## 10. Investigate WPP row-parallel reconstruction for non-grid images
 
 WPP entry points are already parsed and per-row CABAC reinitialization works (`ctu.rs`), but CTU rows still decode serially. Grid images get parallelism from tiles; large single-coded-image HEICs do not.
