@@ -60,6 +60,18 @@ Fixed concurrency and use of the global Rayon pool can oversubscribe mobile CPUs
 
 Expose a concurrency or memory budget, support a caller-provided worker pool, and benchmark conservative mobile defaults such as two to four workers. Prefer ordered streaming of completed tiles so fewer decoded tile buffers need to remain live. Evaluate peak RSS and energy consumption alongside latency.
 
+### Experiment result (2026-07-18): accepted
+
+Replaced the grid decoder's fixed parallel batches with a bounded ordered stream on the existing Rayon pool. Active jobs and completed out-of-order tiles retain per-tile memory permits until row-major consumption, preserving the 64 MiB estimate budget; unestimable tiles drain earlier work and decode synchronously. Validation, errors, panics, and tile paste remain observable in row-major order. The first sub-variant also reduced iOS/Android to four workers, but physical-device testing showed that default was harmful: Pixel full-hook latency regressed 7.28% and iPhone was neutral. The final candidate therefore retained the existing eight-worker ceiling on all targets while keeping bounded streaming.
+
+The final candidate passed formatting, strict Clippy, 76 focused/library/CLI tests, iOS/Android/Wasm portability builds, and two complete validator runs after the scheduler revision: each accounted for all 272 corpus files, passed 219 pixel-oracle cases and 219 production image-hook parity checks, and had zero failures. The 225-file production `image`-crate hook A/B benchmark retained identical fingerprints:
+
+- Apple Silicon desktop: `1.055055x` (baseline 1144.134 ms, candidate 1084.431 ms; +5.51%).
+- Pixel 4 / Android 13: the initial revised B/C/C/B set was noisy because of one unusually fast baseline run; four additional reversed C/B/B/C invocations showed `1.022607x` (baseline 7402.952 ms, candidate 7239.291 ms; +2.26%). Across all eight invocations the result was `0.993735x` (-0.63%), with no repeatable regression and thermal status 0 throughout.
+- iPhone 11 Pro / iOS 26.5: `1.042723x` (baseline 2315.621 ms, candidate 2220.744 ms; +4.27%). Both interleaved pairs improved by roughly 4%; thermal state was nominal until the tail of the final baseline run.
+
+The ordered streaming implementation was kept. It clears the 2% gate repeatably on desktop and iPhone, reduces batch-barrier idle time, and keeps the existing conservative in-flight memory bound. No direct energy counter was available; thermal state was used as the mobile guardrail.
+
 ## 5. Evaluate LTO and profile-guided optimization
 
 The decoder's CABAC and residual paths contain many small helpers and data-dependent branches that may benefit from whole-program optimization and profile feedback.

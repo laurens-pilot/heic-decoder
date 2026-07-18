@@ -30,8 +30,6 @@ use rav1d::{
     Dav1dResult, Rav1dError, dav1d_close, dav1d_data_create, dav1d_data_unref,
     dav1d_default_settings, dav1d_get_picture, dav1d_open, dav1d_picture_unref, dav1d_send_data,
 };
-#[cfg(feature = "parallel-grid")]
-use rayon::prelude::*;
 use scuffle_h265::NALUnitType;
 use source::{
     FileSource, RandomAccessSource, SourceReadError, TempFileSpoolOptions, TempFileSpoolSource,
@@ -4350,59 +4348,178 @@ fn estimate_heic_grid_tile_decode_bytes(
         .max(1))
 }
 
-/// Choose a conservative number of simultaneously decoded tiles from each
-/// tile's own preflight estimate. An estimate failure stops the parallel
-/// window before that tile so normal row-major decoding still selects the
-/// user-visible error.
-#[cfg(feature = "parallel-grid")]
-fn heic_grid_tile_decode_window_from_estimates(
-    estimates: impl IntoIterator<Item = Option<u64>>,
-    available_threads: usize,
-) -> usize {
-    let available_threads = available_threads.max(1);
-    let mut window = 0_usize;
-    let mut estimated_bytes = 0_u64;
-    for tile_bytes in estimates.into_iter().take(available_threads) {
-        let Some(tile_bytes) = tile_bytes else {
-            break;
-        };
-        let next_estimated_bytes = estimated_bytes.saturating_add(tile_bytes.max(1));
-        if window > 0 && next_estimated_bytes > GRID_TILE_DECODE_MEMORY_BUDGET {
-            break;
-        }
-        window += 1;
-        estimated_bytes = next_estimated_bytes;
-        if estimated_bytes >= GRID_TILE_DECODE_MEMORY_BUDGET {
-            break;
-        }
-    }
-    window.max(1)
-}
-
-/// Choose a conservative number of simultaneously decoded tiles. Large,
-/// malformed, or unusual tiles stay sequential instead of inheriting the
-/// first grid tile's geometry and multiplying peak memory.
+/// Choose a pool-aware worker ceiling. Per-tile estimates enforce the memory
+/// bound dynamically in the ordered streaming scheduler.
 #[cfg(feature = "parallel-grid")]
 fn heic_grid_tile_decode_window(remaining_tiles: &[isobmff::HeicGridTileItemData]) -> usize {
     if remaining_tiles.len() <= 1 || cfg!(feature = "decoder-tracing") {
         return 1;
     }
 
-    let available_threads = rayon::current_num_threads()
+    rayon::current_num_threads()
         .min(MAX_GRID_TILE_DECODE_THREADS)
-        .min(remaining_tiles.len());
-    heic_grid_tile_decode_window_from_estimates(
-        remaining_tiles
-            .iter()
-            .map(|tile| estimate_heic_grid_tile_decode_bytes(tile).ok()),
-        available_threads,
-    )
+        .min(remaining_tiles.len())
 }
 
-/// Decode grid tiles in bounded batches, but deliver them to the caller in
-/// row-major order. Keeping validation and paste work on the caller thread
-/// preserves deterministic errors and output while independent HEVC payloads
-/// use the available cores.
+#[cfg(feature = "parallel-grid")]
+enum HeicGridTileDecodeCompletion<T, E> {
+    Decoded {
+        tile_index: usize,
+        result: Result<T, E>,
+    },
+    Panicked {
+        tile_index: usize,
+        payload: Box<dyn core::any::Any + Send>,
+    },
+}
+
+/// Decode independent inputs concurrently while exposing their results only
+/// in input order. A completed result retains its estimated memory permit
+/// until `consume` returns, so active jobs plus out-of-order completions stay
+/// within both bounds. An input that cannot be estimated drains earlier work
+/// and is decoded on the caller thread, preserving malformed-input order.
+#[cfg(feature = "parallel-grid")]
+#[allow(clippy::too_many_arguments)]
+fn for_each_ordered_bounded_parallel<I, T, D, E>(
+    inputs: &[I],
+    first_index: usize,
+    max_in_flight: usize,
+    memory_budget: u64,
+    mut estimate: impl FnMut(&I) -> Option<u64>,
+    decode: impl Fn(&I) -> Result<T, D> + Sync,
+    consume: &mut impl FnMut(usize, T) -> Result<(), E>,
+) -> Result<(), E>
+where
+    I: Sync,
+    T: Send,
+    D: Send,
+    E: From<D>,
+{
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::mpsc;
+
+    if inputs.is_empty() {
+        return Ok(());
+    }
+
+    let max_in_flight = max_in_flight.max(1).min(inputs.len());
+    let memory_budget = memory_budget.max(1);
+    let (sender, receiver) = mpsc::channel::<HeicGridTileDecodeCompletion<T, D>>();
+
+    rayon::in_place_scope_fifo(|scope| {
+        let mut next_to_schedule = 0_usize;
+        let mut next_to_consume = 0_usize;
+        let mut retained_estimates = VecDeque::<u64>::with_capacity(max_in_flight);
+        let mut retained_estimated_bytes = 0_u64;
+        let mut ready = BTreeMap::<usize, HeicGridTileDecodeCompletion<T, D>>::new();
+        let mut next_estimate = None::<Option<u64>>;
+
+        while next_to_consume < inputs.len() {
+            // Prefer a result already buffered for the next row-major
+            // position before admitting more work. Results that race with
+            // admission may still allow bounded speculative decoding, but
+            // they are never exposed to the consumer out of order.
+            while let Ok(completion) = receiver.try_recv() {
+                let tile_index = match &completion {
+                    HeicGridTileDecodeCompletion::Decoded { tile_index, .. }
+                    | HeicGridTileDecodeCompletion::Panicked { tile_index, .. } => *tile_index,
+                };
+                ready.insert(tile_index, completion);
+            }
+            if let Some(completion) = ready.remove(&(first_index + next_to_consume)) {
+                match completion {
+                    HeicGridTileDecodeCompletion::Decoded { result, .. } => {
+                        consume(first_index + next_to_consume, result.map_err(E::from)?)?;
+                    }
+                    HeicGridTileDecodeCompletion::Panicked { payload, .. } => {
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+                let released_estimate = retained_estimates
+                    .pop_front()
+                    .expect("a completed grid tile must retain one memory estimate");
+                retained_estimated_bytes =
+                    retained_estimated_bytes.saturating_sub(released_estimate);
+                next_to_consume += 1;
+                continue;
+            }
+
+            // Fill only permits made available by ordered consumption. This
+            // avoids a completed later tile allowing another allocation while
+            // an earlier decoded tile is still retained.
+            while next_to_schedule < inputs.len() && retained_estimates.len() < max_in_flight {
+                let estimated_bytes =
+                    next_estimate.get_or_insert_with(|| estimate(&inputs[next_to_schedule]));
+                let Some(estimated_bytes) = *estimated_bytes else {
+                    break;
+                };
+                let estimated_bytes = estimated_bytes.max(1);
+                let next_estimated_bytes = retained_estimated_bytes.saturating_add(estimated_bytes);
+                if !retained_estimates.is_empty() && next_estimated_bytes > memory_budget {
+                    break;
+                }
+
+                let relative_index = next_to_schedule;
+                let tile_index = first_index + relative_index;
+                let input = &inputs[relative_index];
+                let sender = sender.clone();
+                let decode = &decode;
+                scope.spawn_fifo(move |_| {
+                    let completion =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            decode(input)
+                        })) {
+                            Ok(result) => {
+                                HeicGridTileDecodeCompletion::Decoded { tile_index, result }
+                            }
+                            Err(payload) => HeicGridTileDecodeCompletion::Panicked {
+                                tile_index,
+                                payload,
+                            },
+                        };
+                    // A callback panic can drop the receiver while sibling
+                    // workers finish. That is normal scope unwinding, not a
+                    // second panic from the worker.
+                    let _ = sender.send(completion);
+                });
+
+                retained_estimates.push_back(estimated_bytes);
+                retained_estimated_bytes = next_estimated_bytes;
+                next_to_schedule += 1;
+                next_estimate = None;
+            }
+
+            // An unestimable tile is deliberately not admitted beside other
+            // work. Once all preceding permits drain, decode it synchronously
+            // so its original decoder error remains the next visible result.
+            if next_to_schedule == next_to_consume && retained_estimates.is_empty() {
+                let tile_index = first_index + next_to_consume;
+                let tile = decode(&inputs[next_to_consume]).map_err(E::from)?;
+                consume(tile_index, tile)?;
+                next_to_consume += 1;
+                next_to_schedule += 1;
+                next_estimate = None;
+                continue;
+            }
+
+            let completion = receiver
+                .recv()
+                .expect("a scoped grid worker must report completion before exiting");
+            let tile_index = match &completion {
+                HeicGridTileDecodeCompletion::Decoded { tile_index, .. }
+                | HeicGridTileDecodeCompletion::Panicked { tile_index, .. } => *tile_index,
+            };
+            ready.insert(tile_index, completion);
+        }
+
+        Ok(())
+    })
+}
+
+/// Decode grid tiles with a bounded number of in-flight jobs, but deliver them
+/// to the caller in row-major order. Keeping validation and paste work on the
+/// caller thread preserves deterministic errors and output while independent
+/// HEVC payloads use the available cores.
 fn for_each_decoded_heic_grid_tile<E>(
     grid_data: &isobmff::HeicGridPrimaryItemData,
     first_tile: DecodedHeicImage,
@@ -4421,28 +4538,24 @@ where
 
     #[cfg(feature = "parallel-grid")]
     {
-        let mut next_tile_index = 1_usize;
-        while next_tile_index < grid_data.tiles.len() {
-            let undecoded_tiles = &grid_data.tiles[next_tile_index..];
-            let window = heic_grid_tile_decode_window(undecoded_tiles);
-            if window > 1 {
-                let decoded = undecoded_tiles[..window]
-                    .par_iter()
-                    .map(decode_heic_grid_tile_to_image)
-                    .collect::<Vec<_>>();
+        let window = heic_grid_tile_decode_window(remaining_tiles);
+        if window > 1 {
+            return for_each_ordered_bounded_parallel(
+                remaining_tiles,
+                1,
+                window,
+                GRID_TILE_DECODE_MEMORY_BUDGET,
+                |tile| estimate_heic_grid_tile_decode_bytes(tile).ok(),
+                decode_heic_grid_tile_to_image,
+                &mut consume,
+            );
+        }
 
-                for (offset, tile) in decoded.into_iter().enumerate() {
-                    consume(next_tile_index + offset, tile.map_err(E::from)?)?;
-                }
-                next_tile_index += window;
-            } else {
-                consume(
-                    next_tile_index,
-                    decode_heic_grid_tile_to_image(&grid_data.tiles[next_tile_index])
-                        .map_err(E::from)?,
-                )?;
-                next_tile_index += 1;
-            }
+        for (offset, tile) in remaining_tiles.iter().enumerate() {
+            consume(
+                offset + 1,
+                decode_heic_grid_tile_to_image(tile).map_err(E::from)?,
+            )?;
         }
         Ok(())
     }
@@ -13441,41 +13554,162 @@ mod tests {
 
     #[cfg(feature = "parallel-grid")]
     #[test]
-    fn grid_parallel_window_uses_each_candidate_tile_estimate() {
-        const MIB: u64 = 1024 * 1024;
+    fn grid_parallel_stream_exposes_decode_errors_in_row_major_order() {
+        let inputs = [0_usize, 1, 2, 3];
+        let mut consumed = Vec::new();
+        let result: Result<(), usize> = super::for_each_ordered_bounded_parallel(
+            &inputs,
+            10,
+            3,
+            64,
+            |_| Some(1),
+            |value| {
+                if *value == 1 {
+                    Err(77_usize)
+                } else {
+                    Ok(*value)
+                }
+            },
+            &mut |tile_index, value| {
+                consumed.push((tile_index, value));
+                Ok(())
+            },
+        );
 
-        assert_eq!(
-            super::heic_grid_tile_decode_window_from_estimates(
-                [Some(4 * MIB), Some(80 * MIB), Some(4 * MIB)],
-                8,
-            ),
-            1,
-            "a later oversized tile must not inherit the first candidate's small estimate"
+        assert_eq!(result, Err(77));
+        assert_eq!(consumed, [(10, 0)]);
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    #[test]
+    fn grid_parallel_stream_stops_consuming_after_callback_error() {
+        let inputs = [0_usize, 1, 2, 3];
+        let mut consumed = Vec::new();
+        let result: Result<(), usize> = super::for_each_ordered_bounded_parallel(
+            &inputs,
+            20,
+            3,
+            64,
+            |_| Some(1),
+            |value| Ok::<_, usize>(*value),
+            &mut |tile_index, value| {
+                if tile_index == 21 {
+                    return Err(88_usize);
+                }
+                consumed.push((tile_index, value));
+                Ok(())
+            },
         );
+
+        assert_eq!(result, Err(88));
+        assert_eq!(consumed, [(20, 0)]);
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    #[test]
+    fn grid_parallel_stream_retains_each_tiles_memory_permit_until_consumed() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let events = Mutex::new(Vec::new());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("test pool should build");
+        let result: Result<(), usize> = pool.install(|| {
+            super::for_each_ordered_bounded_parallel(
+                &[0_usize, 1],
+                40,
+                2,
+                64,
+                |value| Some(if *value == 0 { 4 } else { 80 }),
+                |value| {
+                    events
+                        .lock()
+                        .expect("test mutex poisoned")
+                        .push(('d', *value));
+                    if *value == 0 {
+                        // If the second 80-byte job incorrectly inherited the
+                        // first job's small estimate, the dedicated pool has
+                        // ample time to start it before tile 0 is consumed.
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Ok::<_, usize>(*value)
+                },
+                &mut |_, value| {
+                    events
+                        .lock()
+                        .expect("test mutex poisoned")
+                        .push(('c', value));
+                    Ok(())
+                },
+            )
+        });
+
+        assert_eq!(result, Ok(()));
         assert_eq!(
-            super::heic_grid_tile_decode_window_from_estimates(
-                [Some(32 * MIB), Some(32 * MIB), Some(MIB)],
-                8,
-            ),
-            2,
-            "a window may fill the memory budget exactly"
+            *events.lock().expect("test mutex poisoned"),
+            [('d', 0), ('c', 0), ('d', 1), ('c', 1)]
         );
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    #[test]
+    fn grid_parallel_stream_decodes_unestimable_input_on_caller_thread() {
+        use std::sync::Mutex;
+
+        let caller_thread = std::thread::current().id();
+        let unestimable_thread = Mutex::new(None);
+        let mut consumed = Vec::new();
+        let result: Result<(), usize> = super::for_each_ordered_bounded_parallel(
+            &[0_usize, 1, 2],
+            30,
+            3,
+            64,
+            |value| (*value != 1).then_some(1),
+            |value| {
+                if *value == 1 {
+                    *unestimable_thread.lock().expect("test mutex poisoned") =
+                        Some(std::thread::current().id());
+                }
+                Ok::<_, usize>(*value)
+            },
+            &mut |tile_index, value| {
+                consumed.push((tile_index, value));
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(consumed, [(30, 0), (31, 1), (32, 2)]);
         assert_eq!(
-            super::heic_grid_tile_decode_window_from_estimates(
-                [Some(4 * MIB), None, Some(4 * MIB)],
-                8,
-            ),
-            1,
-            "a tile whose metadata cannot be preflighted must stay outside the parallel window"
+            *unestimable_thread.lock().expect("test mutex poisoned"),
+            Some(caller_thread)
         );
-        assert_eq!(
-            super::heic_grid_tile_decode_window_from_estimates(
-                core::iter::repeat_n(Some(MIB), 16),
-                8,
-            ),
-            8,
-            "the thread cap must remain effective for small tiles"
-        );
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    #[test]
+    fn grid_parallel_stream_propagates_worker_panics_without_hanging() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut consume = |_: usize, _: usize| Ok::<_, usize>(());
+            let _: Result<(), usize> = super::for_each_ordered_bounded_parallel(
+                &[0_usize, 1],
+                0,
+                2,
+                64,
+                |_| Some(1),
+                |value| {
+                    if *value == 0 {
+                        panic!("intentional grid worker panic");
+                    }
+                    Ok::<_, usize>(*value)
+                },
+                &mut consume,
+            );
+        }));
+
+        assert!(result.is_err());
     }
 
     #[cfg(feature = "parallel-grid")]
