@@ -116,6 +116,18 @@ Several individually positive but sub-gate residual/CABAC experiments were rejec
 
 Combine the mutually compatible ones into a single candidate. The most promising component is bypass-bin batching: `decode_bypass_bits` and sign-run decoding still loop one bin at a time; a modest 2–4 bit unroll with one shared refill check should help without repeating the failed 64-bit code-window redesign (x0.906 — do not retry). Avoid large fused lookup tables (2 KiB variant) since cache pressure is worse on mobile.
 
+### Experiment result (2026-07-18): rejected
+
+Implemented a deliberately smaller coherent bundle after auditing the accepted history: exact 2/3/4-bin CABAC bypass chunks with one refill-boundary check and fixed shift/subtract reconstruction, plus 240 bytes of scan-position-ordered significance-context tables. The failed 64-bit code window and 2 KiB fused lookup were not retried, and already-accepted helper/scan work was not duplicated. A proposed unchecked residual-context access was removed during the agent's final safety audit because malformed SPS transform sizes made its local proof insufficient without changing error precedence. Tracing and malformed CABAC states retained the scalar path.
+
+The candidate passed exhaustive bypass/refill/EOF/malformed-state/EGk differential tests, tracing and portability suites, and the complete validator gate: 272 corpus files accounted for, 219 pixel-oracle cases passed, 219 production image-hook parity checks passed, and zero failures. The 225-file production `image`-crate hook A/B benchmark retained identical fingerprints but regressed on every target:
+
+- Apple Silicon desktop: `0.965703x` (baseline 1068.061 ms, candidate 1105.993 ms; -3.43%).
+- Pixel 4 / Android 13: `0.972145x` (baseline 7216.484 ms, candidate 7423.260 ms; -2.79%; thermal status 0 before/after).
+- iPhone 11 Pro / iOS 26.5: `0.995123x` (baseline 2201.718 ms, candidate 2212.509 ms; -0.49%; nominal thermal state throughout).
+
+The implementation was reverted. The safe retained subset added instruction/control overhead rather than reducing end-to-end CABAC cost on the accepted decoder stack.
+
 ## 8. Remove full-plane clones in SAO
 
 SAO edge-offset processing clones the entire Y, Cb, and Cr planes (`sao.rs`) to preserve original neighbor values, plus a `deblock_flags` clone per pass. On desktop this measured only ~x1.026 when addressed, but full-plane allocation and memcpy cost relatively more on mobile's smaller caches and lower memory bandwidth, and also costs energy.
