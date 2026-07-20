@@ -1,8 +1,0 @@
-# Fixed, real-camera HEIC performance corpus. Paths are relative to the repo.
-# The controller verifies these files against the hashes captured by `setup`.
-.heic-test-assets/ente-test-fixtures/media/heic/v1/files/1718_rotate_90_cw.HEIC
-.heic-test-assets/ente-test-fixtures/media/heic/v1/files/7765_horizontal_normal.HEIC
-.heic-test-assets/ente-test-fixtures/media/heic/v1/files/7949_mirror_horizontal_rotate_270_cw.HEIC
-.heic-test-assets/ente-test-fixtures/media/heic/v1/files/IMG_0682_pano.HEIC
-.heic-test-assets/ente-test-fixtures/media/heic/v1/files/IMG_0983.HEIC
-.heic-test-assets/ente-test-fixtures/media/heic/v1/files/IMG_8606_rotate_90_cw_contains_text.HEIC

@@ -175,12 +175,6 @@ an external libheif checkout with `HEIC_LIBHEIF_SOURCE_DIR`, or place a checkout
 or symlink at `.heic-test-assets/libheif`. A libheif checkout directly at
 `.heic-test-assets` is accepted too.
 
-For unattended, correctness-gated decoder optimization experiments, see
-`autoresearch/README.md`. Its trusted controller benchmarks each candidate
-against the current champion through Ente's production-shaped `image` crate
-hook path and commits only faster candidates that pass the full pixel-exact
-validator suite and a broader confirmation benchmark.
-
 ## License
 
 This crate is maintained inside the Ente monorepo.
