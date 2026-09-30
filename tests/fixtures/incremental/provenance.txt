@@ -1,0 +1,35 @@
+  Incremental reconstruction regression fixtures
+
+  These are small synthetic HEVC fixtures preserved from the incremental
+  decoding experiment. Direct, tall, grid, pipeline, and transformed versions
+  exercise row lifetime and pixel mapping. The HEIC and golden files below
+  are the exact bytes used for the comparisons.
+
+  Golden PNGs were generated as RGBA8 using strict primary-image decoding
+  from libheif 1.21.2, commit 78638f4fe417e49f2b129f42ae691a4954560bbd,
+  backed by libde265 1.1.1. No decoding warnings were returned.
+
+  odd-single-grid.png uses the same source with libheif-border-index.patch
+  applied. In the 4:2:0 bilinear upsampling border loops, cx and cy already
+  count chroma samples, so dividing them by two again reads the wrong
+  positions. The patch corrects only those indices. The original oracle
+  disagrees with this fixture by up to 255 at the outer border; all samples
+  differing by more than one lie on that border. The corrected oracle and
+  incremental decoder agree within one. This exception is local to a pinned
+  fixture, not a global relaxation or an upstream-confirmed fix.
+
+  Other fixture PNGs use the original unmodified oracle. They have no ICC
+  profile, and their alpha is opaque. Allocation tests compare these golden
+  images through an independent area average. Cases without a PNG compare
+  to the existing Rust full decoder plus independent area averaging.
+
+  oriented.heic b0ebe900e032c31202a08ad05397c136e8d06acb7059db7fe9f2cf175f686459
+  oriented.png 964d6d579838befec5d6c93c00eaedb225f46d312cac16d7607dd7a9a646427c
+  odd-short.heic 45e9f6072a24375726e65ad1b509174197814d97ac9ae8d99ca4bd547f3e6752
+  odd-short.png bd5445031d644ef81224ad05c01a5c0be15b38a58708193eee4072bfc0c828bf
+  odd-tall.heic 521bd63e5c470949110e7a2fbea0a5ee9359c6735fe4532eefa8c2c222d6abb9
+  odd-tall.png 5972a60c0c494fccbf2f6eac3820b2212dd1bb3ebf1857c0ae4f4a0309911739
+  odd-pipeline.heic 100b99d664bf7f68f579a4735608d6b087c3957e45b739257f23b3b0f069042f
+  odd-pipeline.png a88ef579993b69e4a82f3d5b4a163ac7a249ef67dbe89cc8d3b68e660ab14b01
+  odd-single-grid.heic 66e552583eeff858b2277c71b499a28d696e18ad9120ccecedfbf64a7f71f2d0
+  odd-single-grid.png 297da7245b5791680891d37664aad6ff371ad05f65c73f73b182240c59118c87
