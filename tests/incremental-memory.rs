@@ -10,6 +10,7 @@ fn measure(
     side: u32,
     budget: usize,
     request_limit: usize,
+    expect_sao_edges: bool,
 ) -> (heic_decoder::BoundedRgbImage, usize) {
     let baseline = LIVE.load(Ordering::SeqCst);
     PEAK.store(baseline, Ordering::SeqCst);
@@ -30,7 +31,8 @@ fn measure(
     assert_eq!(DENIED.load(Ordering::SeqCst), 0);
     assert!(peak <= budget);
     let (image, stats) = result.unwrap();
-    assert!(stats[1] > 0);
+    assert!(stats[0] > 0);
+    assert_eq!(stats[1] > 0, expect_sao_edges);
     (image, peak)
 }
 
@@ -98,6 +100,8 @@ fn main() {
         "direct",
         "tall",
         "grid",
+        "grid-pipeline",
+        "undefined-grid-nclx",
         "crop",
         "oriented",
         "pipeline",
@@ -105,6 +109,8 @@ fn main() {
         "odd-tall",
         "odd-pipeline",
         "odd-single-grid",
+        "odd-width-grid",
+        "odd-height-grid",
     ] {
         let path = directory.join(format!("{name}.heic"));
         let bytes = std::fs::read(&path).unwrap();
@@ -118,9 +124,25 @@ fn main() {
         } else {
             128 * 1024
         };
-        let (file_image, path_peak) = measure(BoundedInput::Path(&path), 65, budget, request_limit);
-        let (byte_image, byte_peak) =
-            measure(BoundedInput::Bytes(&bytes), 65, budget, request_limit);
+        let expect_sao_edges = name != "odd-height-grid";
+        let before = THREADS.load(Ordering::SeqCst);
+        let (file_image, path_peak) = measure(
+            BoundedInput::Path(&path),
+            65,
+            budget,
+            request_limit,
+            expect_sao_edges,
+        );
+        let path_workers = THREADS.load(Ordering::SeqCst) - before;
+        let before = THREADS.load(Ordering::SeqCst);
+        let (byte_image, byte_peak) = measure(
+            BoundedInput::Bytes(&bytes),
+            65,
+            budget,
+            request_limit,
+            expect_sao_edges,
+        );
+        let byte_workers = THREADS.load(Ordering::SeqCst) - before;
         assert_eq!(file_image.image.pixels, byte_image.image.pixels);
         assert!(path_peak.abs_diff(byte_peak) < 64 * 1024);
         let image = &file_image.image;
@@ -134,7 +156,8 @@ fn main() {
             "{name}: area-filter parity"
         );
         if name.ends_with("pipeline") {
-            assert!(THREADS.load(Ordering::SeqCst) >= 2);
+            assert!(path_workers > 0);
+            assert!(byte_workers > 0);
         }
         if name == "direct" || name == "tall" {
             scratch.push(path_peak - image.pixels.len());
@@ -151,6 +174,37 @@ fn main() {
     }
     assert!(scratch[0].abs_diff(scratch[1]) < 16 * 1024);
     assert!(odd_scratch[0].abs_diff(odd_scratch[1]) < 16 * 1024);
+    let path = directory.join("invalid-grid-references.bin");
+    let bytes = std::fs::read(&path).unwrap();
+    for input in [BoundedInput::Path(&path), BoundedInput::Bytes(&bytes)] {
+        let budget = 256 * 1024;
+        let baseline = LIVE.load(Ordering::SeqCst);
+        PEAK.store(baseline, Ordering::SeqCst);
+        LARGEST.store(0, Ordering::SeqCst);
+        DENIED.store(0, Ordering::SeqCst);
+        MAX_REQUEST.store(budget, Ordering::SeqCst);
+        MAX_LIVE.store(baseline + budget, Ordering::SeqCst);
+        ACTIVE.store(true, Ordering::SeqCst);
+        let result = decode_incremental_experiment(
+            input,
+            BoundedDecodeOptions {
+                max_side: 65,
+                max_memory_bytes: budget,
+            },
+        );
+        ACTIVE.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            result,
+            Err(heic_decoder::BoundedDecodeError::Malformed("tile count"))
+        ));
+        assert_eq!(DENIED.load(Ordering::SeqCst), 0);
+        assert!(PEAK.load(Ordering::SeqCst) - baseline <= budget);
+        println!(
+            "invalid grid count: peak={}, largest_request={}",
+            PEAK.load(Ordering::SeqCst) - baseline,
+            LARGEST.load(Ordering::SeqCst)
+        );
+    }
     let path = directory.join("tall.heic");
     let baseline = LIVE.load(Ordering::SeqCst);
     PEAK.store(baseline, Ordering::SeqCst);

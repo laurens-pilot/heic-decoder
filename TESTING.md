@@ -168,7 +168,10 @@ The opt-in `incremental-experiment` feature is tested separately because
 `--all-features` also enables decoder tracing, which disables bounded decode.
 The standalone allocation test imposes both live-heap and individual-request
 ceilings across decoding and conversion threads. It covers Path/Bytes parity,
-source-height growth, odd crops, grid clipping, and early budget rejection.
+source-height growth, odd crops on both axes, grid clipping, tile color-profile
+inheritance, threaded grid tiles, and early budget rejection. The malformed
+reference fixture uses `.bin` and is tested under a 256 KiB ceiling separately
+from the positive `*.heic` oracle comparisons.
 
 ```bash
 cargo test --release --locked --features incremental-experiment --lib --bins --test incremental-memory

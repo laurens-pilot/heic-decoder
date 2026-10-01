@@ -174,8 +174,8 @@ fn plan<'a>(index: &Index<'a>, source: &mut Source<'_>, budget: &Budget) -> Resu
     {
         return Err(Error::LimitExceeded("experiment image dimensions"));
     }
-    let mut items = Vec::new();
-    if is_grid {
+    let tile_count = (rows * columns) as usize;
+    let reference = if is_grid {
         let mut references = index
             .references
             .iter()
@@ -186,17 +186,20 @@ fn plan<'a>(index: &Index<'a>, source: &mut Source<'_>, budget: &Budget) -> Resu
         if references.next().is_some() {
             return Err(Error::Malformed("duplicate grid references"));
         }
-        for id in reference.targets() {
-            items.push(index.item(id)?);
+        if reference.targets().count() != tile_count {
+            return Err(Error::Malformed("tile count"));
         }
+        Some(reference)
     } else {
-        items.push(primary);
-    }
-    if items.len() != (rows * columns) as usize {
-        return Err(Error::Malformed("tile count"));
-    }
-    let mut tiles = budget.buffer::<Tile<'a>>(items.len(), "tile index")?;
-    for item in items {
+        None
+    };
+    let tile_ids = reference
+        .into_iter()
+        .flat_map(|reference| reference.targets())
+        .chain((!is_grid).then_some(index.items[primary].id));
+    let mut tiles = budget.buffer::<Tile<'a>>(tile_count, "tile index")?;
+    for id in tile_ids {
+        let item = index.item(id)?;
         if !matches!(&index.items[item].kind, b"hvc1" | b"hev1") {
             return Err(Error::Unsupported("direct HEVC item required"));
         }
@@ -286,7 +289,13 @@ pub fn decode(
         None
     };
     let mut color = grid.tiles[0].color.clone();
-    if grid.properties.color.nclx.is_some() {
+    if grid
+        .properties
+        .color
+        .nclx
+        .as_ref()
+        .is_some_and(|n| !n.is_undefined())
+    {
         color.nclx = grid.properties.color.nclx.clone();
     }
     if grid.properties.color.icc.is_some() {
@@ -709,13 +718,14 @@ impl Conversion {
                             .saturating_sub(1)
                             .max(geometry.crop[2] as usize / 2)
                     } else {
-                        (sy / 2 + 1).min((geometry.crop[2] + geometry.height) as usize / 2 - 1)
+                        (sy / 2 + 1)
+                            .min(((geometry.crop[2] + geometry.height) as usize).div_ceil(2) - 1)
                     };
                     let cx = (x + column) / 2;
                     let neighbor_x = if column % 2 == 0 {
                         cx.saturating_sub(1).max(x / 2)
                     } else {
-                        (cx + 1).min((x + width) / 2 - 1)
+                        (cx + 1).min((x + width).div_ceil(2) - 1)
                     };
                     let chroma = |plane: &[u16], component: usize| {
                         let stride = frame.c_stride();

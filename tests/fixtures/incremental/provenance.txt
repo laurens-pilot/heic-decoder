@@ -33,3 +33,42 @@
   odd-pipeline.png a88ef579993b69e4a82f3d5b4a163ac7a249ef67dbe89cc8d3b68e660ab14b01
   odd-single-grid.heic 66e552583eeff858b2277c71b499a28d696e18ad9120ccecedfbf64a7f71f2d0
   odd-single-grid.png 297da7245b5791680891d37664aad6ff371ad05f65c73f73b182240c59118c87
+
+Review regression fixtures
+
+odd-width-grid derives from odd-single-grid by setting the visible grid
+width to 255 and clean-aperture width to 253. Its paired 256-wide canvas
+with a horizontal aperture offset of -1/2 produces the identical strict
+oracle PNG. The retained aperture excludes the original canvas borders.
+
+odd-height-grid uses the same tile decoded by FFmpeg 9.0.1, rotated
+clockwise, and encoded with libx265 lossless=1:keyint=1:wpp=0:
+repeat-headers=1:pools=none as yuv420p. It has a 256x255 grid canvas and
+centered 254x253 aperture. A 256-high control with vertical aperture
+offset -1/2 produces the identical strict oracle PNG. The PPS enables
+transquant bypass; decoded SAO components are zero.
+
+undefined-grid-nclx derives from grid.heic with nclx 1/13/1, limited range,
+associated to all tiles and nclx 2/2/2, full range, on the primary. A
+control omitting only the primary association produces the same PNG.
+
+All three new PNGs use the original strict pinned libheif oracle above,
+without the border patch, and return zero warnings.
+
+grid-pipeline repeats pipeline.heic's HEVC tile in a 2x2 grid using
+scripts/incremental/wrap.rb. Each tile is 1024x1088; the visible canvas is
+2048x2176. Strict live-oracle comparisons pass at max_side 6000 and 65.
+
+invalid-grid-references.bin is deliberately malformed. It derives from
+grid.heic by replacing its four dimg targets with 65,535 references to
+tile 1, updating box lengths and iloc offsets, while retaining the 2x2
+descriptor. Allocation tests require tile-count rejection within 256 KiB
+for both Path and Bytes. It is excluded from positive *.heic comparisons.
+  odd-width-grid.heic 141cc7d1424fd35a39e7e49817d617f69d5869f7e3751d9fdcd56ea8b3b0ab1d
+  odd-width-grid.png 0952e4e5854265288e177d1ee653cd80a6eb93ca5c36af225301554dc1161c58
+  odd-height-grid.heic 5eeb3d220405fa543372e10c476027700582834036ae09f89065be9abbf3306c
+  odd-height-grid.png 9ad100a8a2abeb43af6899bf9b0836c12214abfadfe882b2293a928dbd66dce4
+  undefined-grid-nclx.heic acae1c33123cdfc38fd4ec1037c6ac3711cd3aa5541c0a6f7f1bb607badd3cd3
+  undefined-grid-nclx.png af8bb8adb31a93d7ba9f4ff7e1008ae1611c2d1b253a3e5fcbffc37489530312
+  grid-pipeline.heic 6b0d3898a26e0894c9b2d4ee6ca266f60ad342f628005f4dbbcdd232638d2eef
+  invalid-grid-references.bin 2334242c0daadc747623a512007a5a3b91c6cbf81a2062b3e334c8f87f537b18
