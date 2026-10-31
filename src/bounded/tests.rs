@@ -67,6 +67,24 @@ fn fixture_with_exif_info(
     orientation: Option<u8>,
     exif_info: &[u8],
 ) -> Vec<u8> {
+    fixture_with_payload_mode(
+        configs,
+        payload,
+        extra_properties,
+        orientation,
+        exif_info,
+        false,
+    )
+}
+
+fn fixture_with_payload_mode(
+    configs: &[Vec<u8>],
+    payload: &[u8],
+    extra_properties: &[Vec<u8>],
+    orientation: Option<u8>,
+    exif_info: &[u8],
+    prefixed: bool,
+) -> Vec<u8> {
     let count = configs.len() as u16;
     let primary = count + 1;
     let item_count = primary + u16::from(orientation.is_some());
@@ -77,7 +95,11 @@ fn fixture_with_exif_info(
         15u16.to_be_bytes().to_vec(),
     ]
     .concat();
-    let payload = [&(payload.len() as u32).to_be_bytes()[..], payload].concat();
+    let payload = if prefixed {
+        payload.to_vec()
+    } else {
+        [&(payload.len() as u32).to_be_bytes()[..], payload].concat()
+    };
     let mut info = item_count.to_be_bytes().to_vec();
     let mut locations = vec![0x44, 0];
     locations.extend_from_slice(&item_count.to_be_bytes());
@@ -301,7 +323,7 @@ fn hevc_preflight_rejects_invalid_ctb_fields_without_panicking() {
             panic!("expected grid");
         };
         let tile = &grid.tiles[0];
-        let guardrails = crate::DecodeGuardrails::default();
+        let guardrails = crate::DecodeOptions::default();
         for error in [
             crate::geometry::preflight_grid(&grid, &guardrails).unwrap_err(),
             crate::geometry::preflight_hevc(&tile.hvcc, &tile.payload, Some((16, 16)), &guardrails)
@@ -323,11 +345,43 @@ fn hevc_preflight_accepts_legal_ctb_sizes() {
             panic!("expected grid");
         };
         let tile = &grid.tiles[0];
-        let guardrails = crate::DecodeGuardrails::default();
+        let guardrails = crate::DecodeOptions::default();
         crate::geometry::preflight_grid(&grid, &guardrails).unwrap();
         crate::geometry::preflight_hevc(&tile.hvcc, &tile.payload, Some((16, 16)), &guardrails)
             .unwrap();
     }
+}
+
+#[test]
+fn aggregate_memory_rejects_repeated_grid_payloads_before_materialization() {
+    let nals = nal_sets();
+    let config = configuration(&nals[1]);
+    let mut filler = vec![0xff; 128 * 1024];
+    filler[..2].copy_from_slice(&[0x4c, 0x01]);
+    *filler.last_mut().unwrap() = 0x80;
+    let payload = [
+        &(filler.len() as u32).to_be_bytes()[..],
+        &filler,
+        &(nals[3].len() as u32).to_be_bytes()[..],
+        &nals[3],
+    ]
+    .concat();
+    let input = fixture_with_payload_mode(&vec![config; 32], &payload, &[], None, b"Exif\0", true);
+    crate::decode_bytes_to_rgba(&input).unwrap();
+    let options = crate::DecodeOptions {
+        max_memory_bytes: Some(4 * 1024 * 1024),
+        ..Default::default()
+    };
+    let result = crate::decode_bytes_to_rgba_with_options(&input, options);
+    assert!(matches!(
+        result,
+        Err(crate::DecodeError::Guardrail(
+            crate::DecodeGuardrailError::DecodedByteCountExceeded {
+                stage: "aggregate decode",
+                ..
+            }
+        ))
+    ));
 }
 
 #[test]

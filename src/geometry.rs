@@ -50,7 +50,7 @@ fn enforce_decoded_bytes(
 fn check_sps(
     sps: &heic_decoder::hevc::params::Sps,
     expected: Option<(u32, u32)>,
-    guardrails: &DecodeGuardrails,
+    guardrails: &DecodeOptions,
 ) -> Result<u64, DecodeError> {
     let log2_ctb_size = u16::from(sps.log2_min_luma_coding_block_size_minus3)
         + 3
@@ -85,7 +85,7 @@ pub(super) fn preflight_hevc(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
     payload: &[u8],
     expected: Option<(u32, u32)>,
-    guardrails: &DecodeGuardrails,
+    guardrails: &DecodeOptions,
 ) -> Result<u64, DecodeError> {
     let mut bytes = None;
     let mut failure = None;
@@ -124,7 +124,7 @@ pub(super) fn preflight_hevc(
 
 pub(super) fn preflight_grid(
     grid: &isobmff::HeicGridPrimaryItemData,
-    guardrails: &DecodeGuardrails,
+    guardrails: &DecodeOptions,
 ) -> Result<(), DecodeError> {
     validate_heic_grid_descriptor_and_tile_count(grid)?;
     let descriptor = &grid.descriptor;

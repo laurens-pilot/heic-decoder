@@ -1,10 +1,10 @@
-use heic_decoder::DecodeGuardrails;
+use heic_decoder::DecodeOptions;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage(program_name: &str) {
     eprintln!(
-        "Usage: {program_name} [--orientation <auto|preserve>] [--max-input-bytes <bytes>] [--max-pixels <pixels>] [--max-temp-spool-bytes <bytes>] [--temp-spool-directory <path>] <input.heif|.heic|.avif> <output.png>"
+        "Usage: {program_name} [--orientation <auto|preserve>] [--max-input-bytes <bytes>] [--max-memory-bytes <bytes>] [--max-pixels <pixels>] [--max-temp-spool-bytes <bytes>] [--temp-spool-directory <path>] <input.heif|.heic|.avif> <output.png>"
     );
 }
 
@@ -18,7 +18,7 @@ enum OrientationMode {
 struct CliInvocation {
     input_path: PathBuf,
     output_path: PathBuf,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
     orientation_mode: OrientationMode,
 }
 
@@ -49,7 +49,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut positional = Vec::new();
-    let mut guardrails = DecodeGuardrails::default();
+    let mut guardrails = DecodeOptions::default();
     let mut orientation_mode = OrientationMode::Auto;
     let mut iter = args.into_iter();
 
@@ -69,6 +69,14 @@ where
                     )
                 })?;
                 guardrails.max_input_bytes = Some(parse_u64_option("--max-input-bytes", value)?);
+            }
+            "--max-memory-bytes" => {
+                let value = iter.next().ok_or_else(|| {
+                    CliParseError::InvalidArguments(
+                        "missing value for --max-memory-bytes".to_string(),
+                    )
+                })?;
+                guardrails.max_memory_bytes = Some(parse_u64_option("--max-memory-bytes", value)?);
             }
             "--max-pixels" => {
                 let value = iter.next().ok_or_else(|| {
@@ -141,9 +149,9 @@ fn main() -> ExitCode {
 
     let input_path = Path::new(&invocation.input_path);
     let output_path = Path::new(&invocation.output_path);
-    let mut decoded = match heic_decoder::decode_path_to_rgba_with_guardrails(
+    let mut decoded = match heic_decoder::decode_path_to_rgba_with_options(
         input_path,
-        invocation.guardrails,
+        invocation.guardrails.clone(),
     ) {
         Ok(decoded) => decoded,
         Err(err) => {
@@ -155,7 +163,23 @@ fn main() -> ExitCode {
     if invocation.orientation_mode == OrientationMode::Auto
         && heic_decoder::path_extension_is_heif(input_path)
     {
-        match heic_decoder::exif_orientation_hint_from_path(input_path) {
+        let mut metadata_options = invocation.guardrails.clone();
+        if let Some(limit) = metadata_options.max_memory_bytes {
+            let pixels = match &decoded.pixels {
+                heic_decoder::DecodedRgbaPixels::U8(pixels) => pixels.capacity() as u64,
+                heic_decoder::DecodedRgbaPixels::U16(pixels) => pixels.capacity() as u64 * 2,
+            };
+            let icc = decoded
+                .icc_profile
+                .as_ref()
+                .map_or(0, |icc| icc.capacity() as u64);
+            metadata_options.max_memory_bytes =
+                Some(limit.saturating_sub(pixels.saturating_add(icc)));
+        }
+        match heic_decoder::exif_orientation_hint_from_path_with_options(
+            input_path,
+            metadata_options,
+        ) {
             Ok(hint) => {
                 if let Some(orientation) = hint.orientation_to_apply() {
                     match decoded.apply_exif_orientation(orientation) {
@@ -168,6 +192,10 @@ fn main() -> ExitCode {
                 }
             }
             Err(err) => {
+                if invocation.guardrails.max_memory_bytes.is_some() {
+                    eprintln!("{}", format_decode_failure(&err));
+                    return ExitCode::from(1);
+                }
                 eprintln!(
                     "warning: failed to inspect EXIF orientation for {}: {err}",
                     input_path.display()
@@ -176,7 +204,11 @@ fn main() -> ExitCode {
         }
     }
 
-    match heic_decoder::write_decoded_rgba_to_png(&decoded, output_path) {
+    match heic_decoder::write_decoded_rgba_to_png_with_options(
+        &decoded,
+        output_path,
+        invocation.guardrails.clone(),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{}", format_decode_failure(&err));
@@ -190,7 +222,7 @@ mod tests {
     use super::{
         CliInvocation, CliParseError, OrientationMode, format_decode_failure, parse_cli_invocation,
     };
-    use heic_decoder::{DecodeError, DecodeGuardrails, DecodeHeicError};
+    use heic_decoder::{DecodeError, DecodeHeicError, DecodeOptions};
     use std::path::PathBuf;
 
     #[test]
@@ -218,7 +250,7 @@ mod tests {
             Ok(CliInvocation {
                 input_path: PathBuf::from("input.heic"),
                 output_path: PathBuf::from("output.png"),
-                guardrails: DecodeGuardrails::default(),
+                guardrails: DecodeOptions::default(),
                 orientation_mode: OrientationMode::Auto,
             })
         );
@@ -230,6 +262,8 @@ mod tests {
             parse_cli_invocation([
                 "--max-input-bytes".to_string(),
                 "1048576".to_string(),
+                "--max-memory-bytes".to_string(),
+                "268435456".to_string(),
                 "--orientation".to_string(),
                 "preserve".to_string(),
                 "--max-pixels".to_string(),
@@ -244,8 +278,9 @@ mod tests {
             Ok(CliInvocation {
                 input_path: PathBuf::from("input.heic"),
                 output_path: PathBuf::from("output.png"),
-                guardrails: DecodeGuardrails {
+                guardrails: DecodeOptions {
                     max_input_bytes: Some(1_048_576),
+                    max_memory_bytes: Some(268_435_456),
                     max_pixels: Some(262_144),
                     max_temp_spool_bytes: Some(2_097_152),
                     temp_spool_directory: Some(PathBuf::from("/tmp/heic-decoder-spool")),

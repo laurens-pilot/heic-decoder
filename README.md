@@ -14,6 +14,7 @@ Pure Rust HEIF/HEIC/AVIF decoder with first-class `image` crate integration.
   - `DecodedRgbaImage::apply_exif_orientation`
   - `image_integration::apply_exif_orientation_dynamic`
 - Optional guardrails for bounded production use:
+  - aggregate HEVC-backed HEIC memory estimates with conservative platform presets
   - max input bytes
   - max decoded pixel count
   - max temporary spool bytes for non-seek inputs
@@ -44,18 +45,19 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 ## Decode Example
 
 ```rust
-use heic_decoder::{decode_path_to_rgba_with_guardrails, DecodeGuardrails};
+use heic_decoder::{decode_path_to_rgba_with_options, DecodeOptions};
 use std::path::Path;
 
 fn decode_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let guardrails = DecodeGuardrails {
+    let guardrails = DecodeOptions {
+        max_memory_bytes: DecodeOptions::for_platform().max_memory_bytes,
         max_input_bytes: Some(128 * 1024 * 1024),
         max_pixels: Some(64_000_000),
         max_temp_spool_bytes: Some(128 * 1024 * 1024),
         temp_spool_directory: None,
     };
 
-    let decoded = decode_path_to_rgba_with_guardrails(path, guardrails)?;
+    let decoded = decode_path_to_rgba_with_options(path, guardrails)?;
     println!(
         "decoded {}x{} (storage={}bit)",
         decoded.width,
@@ -74,14 +76,14 @@ fn decode_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 - If your app wants display-oriented output, apply EXIF orientation explicitly:
 
 ```rust
-use heic_decoder::{decode_path_to_rgba, exif_orientation_hint};
+use heic_decoder::{DecodeOptions, decode_path_to_rgba_with_options, exif_orientation_hint_from_path_with_options};
 use std::path::Path;
 
 fn decode_with_explicit_orientation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let input = std::fs::read(path)?;
-    let hint = exif_orientation_hint(&input);
+    let options = DecodeOptions::for_platform();
+    let hint = exif_orientation_hint_from_path_with_options(path, options.clone())?;
 
-    let decoded = decode_path_to_rgba(path)?;
+    let decoded = decode_path_to_rgba_with_options(path, options)?;
     let decoded = if let Some(orientation) = hint.orientation_to_apply() {
         decoded.apply_exif_orientation(orientation)?
     } else {
@@ -96,14 +98,14 @@ fn decode_with_explicit_orientation(path: &Path) -> Result<(), Box<dyn std::erro
 Path-based (no full file read, no pixel decode) orientation hint:
 
 ```rust
-use heic_decoder::{exif_orientation_hint_from_path, path_extension_is_heif};
+use heic_decoder::{DecodeOptions, exif_orientation_hint_from_path_with_options, path_extension_is_heif};
 use std::path::Path;
 
 fn orientation_from_path(path: &Path) -> Result<Option<u8>, heic_decoder::DecodeError> {
     if !path_extension_is_heif(path) {
         return Ok(None);
     }
-    let hint = exif_orientation_hint_from_path(path)?;
+    let hint = exif_orientation_hint_from_path_with_options(path, DecodeOptions::for_platform())?;
     Ok(hint.orientation_to_apply())
 }
 ```
@@ -114,25 +116,28 @@ fn orientation_from_path(path: &Path) -> Result<Option<u8>, heic_decoder::Decode
 use image::ImageReader;
 use heic_decoder::image_integration::{
     apply_exif_orientation_dynamic,
-    register_image_decoder_hooks_with_guardrails,
+    register_image_decoder_hooks_with_options,
 };
-use heic_decoder::{exif_orientation_hint, DecodeGuardrails};
+use heic_decoder::{exif_orientation_hint_with_options, DecodeOptions};
 
-fn init_image_hooks() {
-    let guardrails = DecodeGuardrails {
+fn image_options() -> DecodeOptions {
+    DecodeOptions {
+        max_memory_bytes: DecodeOptions::for_platform().max_memory_bytes,
         max_input_bytes: Some(128 * 1024 * 1024),
         max_pixels: Some(64_000_000),
         max_temp_spool_bytes: Some(128 * 1024 * 1024),
         temp_spool_directory: None,
-    };
+    }
+}
 
-    let registered = register_image_decoder_hooks_with_guardrails(guardrails);
+fn init_image_hooks() {
+    let registered = register_image_decoder_hooks_with_options(image_options());
     assert!(registered.any_decoder_hook_registered());
 }
 
-fn decode_with_image(path: &str) -> image::ImageResult<image::DynamicImage> {
-    let bytes = std::fs::read(path).map_err(image::ImageError::IoError)?;
-    let hint = exif_orientation_hint(&bytes);
+fn decode_with_image(path: &str) -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let hint = exif_orientation_hint_with_options(&bytes, image_options())?;
 
     let image = ImageReader::new(std::io::Cursor::new(&bytes))
         .with_guessed_format()?
@@ -156,11 +161,16 @@ Build:
 cargo build --release --bin heif-decode
 ```
 
+The `--max-memory-bytes` flag opts HEVC-backed HEIC input into an aggregate
+decode-and-PNG memory budget; AVIF and uncompressed HEIF are rejected while it
+is set.
+
 Usage:
 
 ```bash
 target/release/heif-decode \
   --max-input-bytes 134217728 \
+  --max-memory-bytes 268435456 \
   --max-pixels 64000000 \
   --max-temp-spool-bytes 134217728 \
   <input.heif|.heic|.avif> <output.png>

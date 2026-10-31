@@ -8,8 +8,8 @@
 //! See `API.md` in the crate root for end-to-end examples.
 
 use crate::{
-    DecodeError, DecodeGuardrails, DecodedRgbaImage, DecodedRgbaLayout, DecodedRgbaPixels,
-    HeifInputFamily, decode_bytes_to_rgba_layout_with_hint_and_guardrails,
+    DecodeError, DecodeGuardrails, DecodeOptions, DecodedRgbaImage, DecodedRgbaLayout,
+    DecodedRgbaPixels, HeifInputFamily, decode_bytes_to_rgba_layout_with_hint_and_guardrails,
     decode_bytes_to_rgba8_slice_with_hint_and_guardrails,
     decode_bytes_to_rgba16_native_endian_bytes_with_hint_and_guardrails,
 };
@@ -74,7 +74,7 @@ pub fn apply_exif_orientation_dynamic(image: DynamicImage, exif_orientation: u8)
 struct LazyHeifImageDecoder {
     input: Vec<u8>,
     hint: Option<HeifInputFamily>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
     layout: DecodedRgbaLayout,
     // Primary-item payload extraction the layout probe already performed;
     // `read_image` consumes it instead of copying every payload out of the
@@ -99,7 +99,7 @@ impl LazyHeifImageDecoder {
     fn from_encoded_input(
         input: Vec<u8>,
         hint: Option<HeifInputFamily>,
-        guardrails: DecodeGuardrails,
+        guardrails: DecodeOptions,
         probe: crate::RgbaLayoutProbe,
     ) -> Self {
         Self {
@@ -143,7 +143,18 @@ impl ImageDecoder for LazyHeifImageDecoder {
     // and without this override image-crate callers would always see
     // `Orientation::NoTransforms` for EXIF-only-rotated files.
     fn exif_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(crate::primary_exif_tiff_payload(&self.input))
+        let retained_bytes = self
+            .preextracted_heic
+            .as_ref()
+            .map_or(0, crate::memory::retained_primary_bytes)
+            .saturating_add(
+                self.layout
+                    .icc_profile
+                    .as_ref()
+                    .map_or(0, |icc| icc.capacity() as u64),
+            );
+        crate::primary_exif_tiff_payload_with_options(&self.input, &self.guardrails, retained_bytes)
+            .map_err(decode_error_to_image_error)
     }
 
     // Container transforms (`irot`/`imir`) are baked into the decoded pixels,
@@ -208,7 +219,7 @@ impl ImageDecoder for LazyHeifImageDecoder {
 fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
     input_reader: R,
     hint: Option<HeifInputFamily>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> ImageResult<Box<dyn ImageDecoder>> {
     let input = read_seekable_input_to_vec(input_reader, &guardrails)?;
     let probe =
@@ -246,7 +257,7 @@ pub const DEFAULT_HOOK_MAX_INPUT_BYTES: u64 = 128 * 1024 * 1024;
 /// lifetime, bounded by `guardrails.max_input_bytes`.
 fn read_seekable_input_to_vec<R: Read + Seek>(
     mut input_reader: R,
-    guardrails: &DecodeGuardrails,
+    guardrails: &DecodeOptions,
 ) -> ImageResult<Vec<u8>> {
     let input_len = input_reader
         .seek(SeekFrom::End(0))
@@ -265,10 +276,16 @@ fn read_seekable_input_to_vec<R: Read + Seek>(
         ))
     })?;
     let mut input = Vec::with_capacity(capacity);
-    match guardrails
+    let encoded_limit = guardrails
         .max_input_bytes
-        .and_then(|max| max.checked_add(1))
-    {
+        .into_iter()
+        .chain(
+            guardrails
+                .max_memory_bytes
+                .map(|bytes| bytes / crate::memory::INPUT_STORAGE_COPIES),
+        )
+        .min();
+    match encoded_limit.and_then(|max| max.checked_add(1)) {
         Some(read_limit) => input_reader
             .by_ref()
             .take(read_limit)
@@ -328,9 +345,9 @@ impl ImageHookRegistration {
 /// [`register_image_decoder_hooks_with_guardrails`] with
 /// [`DecodeGuardrails::max_input_bytes`] set accordingly.
 pub fn register_image_decoder_hooks() -> ImageHookRegistration {
-    register_image_decoder_hooks_with_guardrails(DecodeGuardrails {
+    register_image_decoder_hooks_with_options(DecodeOptions {
         max_input_bytes: Some(DEFAULT_HOOK_MAX_INPUT_BYTES),
-        ..DecodeGuardrails::default()
+        ..DecodeOptions::default()
     })
 }
 
@@ -341,6 +358,12 @@ pub fn register_image_decoder_hooks() -> ImageHookRegistration {
 /// that buffer.
 pub fn register_image_decoder_hooks_with_guardrails(
     guardrails: DecodeGuardrails,
+) -> ImageHookRegistration {
+    register_image_decoder_hooks_with_options(guardrails.into())
+}
+
+pub fn register_image_decoder_hooks_with_options(
+    guardrails: DecodeOptions,
 ) -> ImageHookRegistration {
     let heif_guardrails = guardrails.clone();
     let heic_decoder_hook_registered = hooks::register_decoding_hook(
@@ -661,8 +684,26 @@ fn decode_error_to_image_error(err: DecodeError) -> ImageError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn budgeted_hook_rejects_accumulated_exif_before_materialization() {
+        use image::ImageDecoder;
+        for input in [
+            crate::geometry_tests::linked_exif_candidates_fixture(128),
+            crate::geometry_tests::unsupported_exif_candidate_fixture(),
+        ] {
+            let mut decoder = super::decoder_from_seekable_with_hint_and_guardrails(
+                std::io::Cursor::new(input),
+                Some(crate::HeifInputFamily::Heif),
+                crate::DecodeGuardrails::default().with_memory_budget(1024 * 1024),
+            )
+            .unwrap();
+            assert_eq!(decoder.dimensions(), (16, 16));
+            assert!(decoder.exif_metadata().is_err());
+            assert!(decoder.orientation().is_err());
+        }
+    }
     use super::{
-        ColorType, DecodeGuardrails, HeifInputFamily, ImageDecoder,
+        ColorType, DecodeOptions, HeifInputFamily, ImageDecoder,
         decoder_from_seekable_with_hint_and_guardrails, read_seekable_input_to_vec,
     };
     use std::cell::Cell;
@@ -679,7 +720,7 @@ mod tests {
         let decoder = decoder_from_seekable_with_hint_and_guardrails(
             Cursor::new(file),
             Some(HeifInputFamily::Heif),
-            DecodeGuardrails::default(),
+            DecodeOptions::default(),
         )
         .expect("hook construction must accept the lazy uncompressed decoder");
         assert_eq!(decoder.dimensions(), (2, 1));
@@ -743,9 +784,9 @@ mod tests {
 
     #[test]
     fn hook_input_read_enforces_limit_while_buffering() {
-        let guardrails = DecodeGuardrails {
+        let guardrails = DecodeOptions {
             max_input_bytes: Some(8),
-            ..DecodeGuardrails::default()
+            ..DecodeOptions::default()
         };
 
         let exact_reads = Rc::new(Cell::new(0));
@@ -778,6 +819,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hook_input_read_enforces_memory_budget_while_buffering() {
+        for max_input_bytes in [None, Some(64)] {
+            let bytes_read = Rc::new(Cell::new(0));
+            let result = read_seekable_input_to_vec(
+                UnderreportedLengthReader {
+                    inner: Cursor::new(vec![2; 64]),
+                    bytes_read: Rc::clone(&bytes_read),
+                },
+                &DecodeOptions {
+                    max_input_bytes,
+                    max_memory_bytes: Some(24),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(bytes_read.get(), 9);
+            assert!(result.unwrap_err().to_string().contains("aggregate decode"));
+        }
+        let input = read_seekable_input_to_vec(
+            UnderreportedLengthReader {
+                inner: Cursor::new(vec![2; 8]),
+                bytes_read: Rc::new(Cell::new(0)),
+            },
+            &DecodeOptions {
+                max_memory_bytes: Some(24),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(input, vec![2; 8]);
+    }
+
     /// Decode does not bake EXIF orientation into pixels, so hook callers
     /// rely on `exif_metadata`/`orientation` to rotate correctly; without
     /// the override they would always see `Orientation::NoTransforms`.
@@ -789,7 +862,7 @@ mod tests {
         let mut decoder = decoder_from_seekable_with_hint_and_guardrails(
             Cursor::new(file),
             Some(HeifInputFamily::Heif),
-            DecodeGuardrails::default(),
+            DecodeOptions::default(),
         )
         .expect("hook construction should succeed");
         assert_eq!(
@@ -829,7 +902,7 @@ mod tests {
         let mut decoder = decoder_from_seekable_with_hint_and_guardrails(
             Cursor::new(file),
             Some(HeifInputFamily::Heif),
-            DecodeGuardrails::default(),
+            DecodeOptions::default(),
         )
         .expect("hook construction should succeed");
 
@@ -878,7 +951,7 @@ mod tests {
         let mut decoder = decoder_from_seekable_with_hint_and_guardrails(
             Cursor::new(file),
             Some(HeifInputFamily::Heif),
-            DecodeGuardrails::default(),
+            DecodeOptions::default(),
         )
         .expect("hook construction should succeed");
 
@@ -911,7 +984,7 @@ mod tests {
         let decoder = decoder_from_seekable_with_hint_and_guardrails(
             LyingLengthReader(Cursor::new(file)),
             Some(HeifInputFamily::Heif),
-            DecodeGuardrails::default(),
+            DecodeOptions::default(),
         )
         .expect("a lying seek length must not fail hook construction");
 

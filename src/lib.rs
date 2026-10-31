@@ -1,8 +1,10 @@
 //! Pure Rust HEIF/HEIC/AVIF decoding APIs.
 //!
-//! For production usage, prefer the `*_with_guardrails` entry points and set
-//! explicit [`DecodeGuardrails`] values for input bytes, decoded pixels, and
-//! non-seek temp spool limits.
+//! For production usage, prefer the `*_with_options` entry points with
+//! [`DecodeOptions::for_platform()`] (or explicit [`DecodeOptions`] values) so
+//! decoding and PNG writes also honor the aggregate memory budget. With a
+//! `max_memory_bytes` allowance set, only HEVC-backed HEIC input is supported;
+//! AVIF and uncompressed HEIF are rejected while the budget is enabled.
 //!
 //! See `API.md` in the crate root for an integration-oriented API guide.
 
@@ -51,6 +53,7 @@ mod bounded;
 mod geometry;
 #[cfg(test)]
 mod geometry_tests;
+mod memory;
 #[cfg(feature = "incremental-experiment")]
 pub use bounded::incremental::decode as decode_incremental_experiment;
 #[path = "heic-decoder/mod.rs"]
@@ -4130,7 +4133,7 @@ fn decode_primary_heic_coded_item_with_alpha(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
     item_data: &isobmff::HeicPrimaryItemData,
-    guardrails: &DecodeGuardrails,
+    guardrails: &DecodeOptions,
 ) -> Result<(DecodedHeicImage, Option<HeicAuxiliaryAlphaPlane>), DecodeError> {
     let properties = parse_and_validate_heic_coded_item_preflight(input, item_data)?;
     geometry::preflight_hevc(&properties.hvcc, &item_data.payload, None, guardrails)?;
@@ -4152,7 +4155,7 @@ fn decode_primary_heic_grid_auxiliary_alpha(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
     grid_data: &isobmff::HeicGridPrimaryItemData,
-    guardrails: &DecodeGuardrails,
+    guardrails: &DecodeOptions,
 ) -> Result<Option<HeicAuxiliaryAlphaPlane>, DecodeError> {
     geometry::preflight_grid(grid_data, guardrails)?;
     decode_primary_heic_auxiliary_alpha_plane_internal(
@@ -4224,8 +4227,7 @@ fn decode_primary_heic_grid_to_image(
         });
     }
 
-    geometry::preflight_grid(grid_data, &DecodeGuardrails::default())
-        .map_err(geometry::heic_error)?;
+    geometry::preflight_grid(grid_data, &DecodeOptions::default()).map_err(geometry::heic_error)?;
     let first_tile = decode_heic_grid_tile_to_image(&grid_data.tiles[0])?;
     let tile_width = first_tile.width;
     let tile_height = first_tile.height;
@@ -4922,8 +4924,7 @@ fn decode_and_validate_heic_grid_first_tile(
             .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
                 detail: "grid tile list cannot be empty".to_string(),
             })?;
-    geometry::preflight_grid(grid_data, &DecodeGuardrails::default())
-        .map_err(geometry::heic_error)?;
+    geometry::preflight_grid(grid_data, &DecodeOptions::default()).map_err(geometry::heic_error)?;
     let first_tile = decode_heic_grid_tile_to_image(first_tile_data)?;
     validate_decoded_heic_grid_first_tile(&grid_data.descriptor, &first_tile)?;
     let source_bit_depth = heic_bit_depth_for_png_conversion(&first_tile)?;
@@ -7285,6 +7286,15 @@ pub fn exif_orientation_hint(input: &[u8]) -> ExifOrientationHint {
     }
 }
 
+pub fn exif_orientation_hint_with_options(
+    input: &[u8],
+    options: DecodeOptions,
+) -> Result<ExifOrientationHint, DecodeError> {
+    options.enforce_input_bytes(input.len() as u64)?;
+    memory::validate_exif(input, &None, &options, 0)?;
+    Ok(exif_orientation_hint(input))
+}
+
 /// Parse the raw EXIF orientation (`1..=8`) from a HEIF/HEIC file path without decoding pixel data.
 ///
 /// This reads container metadata and the EXIF item payload (when present), but does
@@ -7299,6 +7309,13 @@ pub fn primary_exif_orientation_from_path(input_path: &Path) -> Result<Option<u8
 /// full image decode.
 pub fn exif_orientation_hint_from_path(
     input_path: &Path,
+) -> Result<ExifOrientationHint, DecodeError> {
+    exif_orientation_hint_from_path_with_options(input_path, DecodeOptions::default())
+}
+
+pub fn exif_orientation_hint_from_path_with_options(
+    input_path: &Path,
+    options: DecodeOptions,
 ) -> Result<ExifOrientationHint, DecodeError> {
     if !input_path.exists() {
         return Err(DecodeError::Unsupported(format!(
@@ -7317,6 +7334,7 @@ pub fn exif_orientation_hint_from_path(
     }
 
     let mut source = FileSource::open(input_path).map_err(decode_error_from_source_read_error)?;
+    options.enforce_input_bytes(source.len())?;
     let selected =
         read_selected_top_level_boxes_from_source(&mut source, &[FTYP_BOX_TYPE, META_BOX_TYPE])?;
     let source_family_hint = detect_input_family_from_source_selected_boxes(&selected)?;
@@ -7328,12 +7346,13 @@ pub fn exif_orientation_hint_from_path(
     }
 
     let input = encode_source_selected_top_level_boxes(&selected);
+    let mut source_handle: Option<&mut dyn RandomAccessSource> = Some(&mut source);
+    memory::validate_exif(&input, &source_handle, &options, 0)?;
     let primary_item_has_orientation_transform =
         isobmff::parse_primary_item_transform_properties(&input)
             .map(|transforms| transforms_include_orientation(&transforms.transforms))
             .unwrap_or(false);
 
-    let mut source_handle: Option<&mut dyn RandomAccessSource> = Some(&mut source);
     let exif_orientation = primary_exif_orientation_from_heif(&input, &mut source_handle)
         .and_then(|orientation| u8::try_from(orientation).ok())
         .filter(|orientation| (1..=8).contains(orientation));
@@ -7448,14 +7467,19 @@ fn primary_exif_item_payloads(
 /// `ImageDecoder::exif_metadata` consumers expect (starting at the TIFF
 /// byte-order marker, i.e. what `Orientation::from_exif_chunk` parses).
 #[cfg(feature = "image-integration")]
-pub(crate) fn primary_exif_tiff_payload(input: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn primary_exif_tiff_payload_with_options(
+    input: &[u8],
+    options: &DecodeOptions,
+    retained_bytes: u64,
+) -> Result<Option<Vec<u8>>, DecodeError> {
     let mut source: Option<&mut dyn RandomAccessSource> = None;
+    memory::validate_exif(input, &source, options, retained_bytes)?;
     for payload in primary_exif_item_payloads(input, &mut source) {
         if let Some(tiff_start) = exif_item_payload_tiff_start(&payload) {
-            return Some(payload[tiff_start..].to_vec());
+            return Ok(Some(payload[tiff_start..].to_vec()));
         }
     }
-    None
+    Ok(None)
 }
 
 fn item_info_is_exif_candidate(item_info: &isobmff::ItemInfoEntryBox) -> bool {
@@ -7803,7 +7827,7 @@ fn decode_primary_heic_auxiliary_alpha_plane_internal(
     source: &mut Option<&mut dyn RandomAccessSource>,
     expected_width: u32,
     expected_height: u32,
-    guardrails: &DecodeGuardrails,
+    guardrails: &DecodeOptions,
 ) -> Result<Option<HeicAuxiliaryAlphaPlane>, DecodeHeicError> {
     // Provenance: mirrors libheif auxiliary alpha linkage in
     // libheif/libheif/context.cc (auxl reference direction, auxC alpha-type
@@ -7862,7 +7886,7 @@ fn decode_auxiliary_alpha_item_candidate<'a>(
     resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
     item_id: u32,
     expected: (u32, u32),
-    guardrails: &DecodeGuardrails,
+    guardrails: &DecodeOptions,
 ) -> Result<Option<HeicAuxiliaryAlphaPlane>, DecodeHeicError> {
     let Some(stream) = prepare_auxiliary_alpha_hevc_stream(
         input, source, meta, resolved, item_id, expected, guardrails,
@@ -7896,8 +7920,23 @@ fn prepare_auxiliary_alpha_hevc_stream<'a>(
     resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
     item_id: u32,
     expected: (u32, u32),
-    guardrails: &DecodeGuardrails,
+    guardrails: &DecodeOptions,
 ) -> Option<Vec<u8>> {
+    let (hvcc, payload) = prepare_auxiliary_alpha_hevc_components(
+        input, source, meta, resolved, item_id, expected, guardrails,
+    )?;
+    assemble_heic_hevc_stream_from_components(&hvcc, &payload).ok()
+}
+
+fn prepare_auxiliary_alpha_hevc_components<'a>(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    meta: &isobmff::MetaBox<'a>,
+    resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
+    item_id: u32,
+    expected: (u32, u32),
+    guardrails: &DecodeOptions,
+) -> Option<(isobmff::HevcDecoderConfigurationBox, Vec<u8>)> {
     let (expected_width, expected_height) = expected;
     let item_info = resolved
         .iinf
@@ -7949,8 +7988,7 @@ fn prepare_auxiliary_alpha_hevc_stream<'a>(
         guardrails,
     )
     .ok()?;
-    let stream = assemble_heic_hevc_stream_from_components(&hvcc, &payload).ok()?;
-    Some(stream)
+    Some((hvcc, payload))
 }
 
 fn resolved_item_properties_for_item<'a>(
@@ -8100,7 +8138,7 @@ const HEIF_FILE_BRANDS: [[u8; 4]; 9] = [
 
 fn decode_avif_bytes_to_rgba(
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)
         .map_err(DecodeAvifError::ExtractPrimaryPayload)?;
@@ -8113,7 +8151,7 @@ fn decode_avif_to_rgba_from_resolved_graph(
     source: &mut Option<&mut dyn RandomAccessSource>,
     meta: &isobmff::MetaBox<'_>,
     resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     let transforms = isobmff::parse_primary_item_transform_properties_from_resolved_graph(resolved)
         .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
@@ -8132,7 +8170,7 @@ fn decode_avif_to_rgba_from_resolved_graph(
 fn decode_avif_source_to_rgba<S: RandomAccessSource>(
     source: &mut S,
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)
         .map_err(DecodeAvifError::ExtractPrimaryPayload)?;
@@ -8142,7 +8180,7 @@ fn decode_avif_source_to_rgba<S: RandomAccessSource>(
 
 fn decode_heif_bytes_to_rgba(
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     match decode_primary_uncompressed_to_image(input) {
         Ok(decoded) => {
@@ -8175,7 +8213,7 @@ fn decode_heif_bytes_to_rgba(
 fn decode_heif_source_to_rgba<S: RandomAccessSource>(
     source: &mut S,
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     let mut source: Option<&mut dyn RandomAccessSource> = Some(source);
     match decode_primary_uncompressed_to_image_internal(input, &mut source) {
@@ -8207,7 +8245,7 @@ fn decode_heif_source_to_rgba<S: RandomAccessSource>(
 
 fn decode_heif_bytes_to_rgb8(
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbImage, DecodeError> {
     let transforms = isobmff::parse_primary_item_transform_properties(input)
         .map_err(DecodeHeicError::ParsePrimaryTransforms)?
@@ -8226,7 +8264,7 @@ fn decode_heif_bytes_to_rgb8(
 fn decode_heif_source_to_rgb8<S: RandomAccessSource>(
     source: &mut S,
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbImage, DecodeError> {
     let transforms = isobmff::parse_primary_item_transform_properties(input)
         .map_err(DecodeHeicError::ParsePrimaryTransforms)?
@@ -8245,7 +8283,7 @@ fn decode_heif_source_to_rgb8<S: RandomAccessSource>(
 fn decode_primary_heic_to_rgb8_from_resolved_input(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
     transforms: &[isobmff::PrimaryItemTransformProperty],
     icc_profile: Option<Vec<u8>>,
 ) -> Result<DecodedRgbImage, DecodeError> {
@@ -8255,6 +8293,17 @@ fn decode_primary_heic_to_rgb8_from_resolved_input(
     } else {
         isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?
     };
+
+    memory::heic(
+        input,
+        source,
+        &primary_with_grid,
+        &guardrails,
+        true,
+        icc_profile
+            .as_ref()
+            .map_or(0, |profile| profile.len() as u64),
+    )?;
 
     match primary_with_grid {
         isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
@@ -8266,6 +8315,8 @@ fn decode_primary_heic_to_rgb8_from_resolved_input(
             decode_primary_heic_grid_to_rgb8_image(&grid_data, transforms, icc_profile)
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
+            let properties = parse_and_validate_heic_coded_item_preflight(input, &item_data)?;
+            geometry::preflight_hevc(&properties.hvcc, &item_data.payload, None, &guardrails)?;
             let decoded = decode_primary_heic_coded_item_to_image(input, &item_data)?;
             guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
             decoded_heic_to_rgb8_image(decoded, transforms, icc_profile)
@@ -8276,7 +8327,7 @@ fn decode_primary_heic_to_rgb8_from_resolved_input(
 fn decode_primary_heic_to_rgba_from_resolved_input(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
     transforms: &[isobmff::PrimaryItemTransformProperty],
     icc_profile: Option<Vec<u8>>,
 ) -> Result<DecodedRgbaImage, DecodeError> {
@@ -8286,6 +8337,17 @@ fn decode_primary_heic_to_rgba_from_resolved_input(
     } else {
         isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?
     };
+
+    memory::heic(
+        input,
+        source,
+        &primary_with_grid,
+        &guardrails,
+        false,
+        icc_profile
+            .as_ref()
+            .map_or(0, |profile| profile.len() as u64),
+    )?;
 
     match primary_with_grid {
         isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
@@ -8394,7 +8456,8 @@ impl RgbaLayoutProbe {
 #[cfg(feature = "image-integration")]
 fn decode_heif_bytes_to_rgba_layout(
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
+    preextracted: Option<isobmff::HeicPrimaryItemDataWithGrid>,
 ) -> Result<RgbaLayoutProbe, DecodeError> {
     match isobmff::parse_primary_uncompressed_item_properties(input) {
         Ok(properties) => {
@@ -8447,11 +8510,17 @@ fn decode_heif_bytes_to_rgba_layout(
             &transforms,
             icc_profile,
         )
-        .map(RgbaLayoutProbe::without_extraction);
+        .map(|layout| RgbaLayoutProbe {
+            layout,
+            preextracted_heic: preextracted,
+        });
     }
 
-    let primary_with_grid =
-        isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?;
+    let primary_with_grid = match preextracted {
+        Some(primary) => primary,
+        None => isobmff::extract_primary_heic_item_data_with_grid(input)
+            .map_err(DecodeHeicError::from)?,
+    };
 
     let layout = match &primary_with_grid {
         isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
@@ -8501,7 +8570,7 @@ fn decode_heif_bytes_to_rgba_layout(
 #[cfg(feature = "image-integration")]
 fn decode_avif_bytes_to_rgba_layout(
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbaLayout, DecodeError> {
     let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)
         .map_err(DecodeAvifError::ExtractPrimaryPayload)?;
@@ -9241,7 +9310,7 @@ fn decoded_heic_to_rgba_output<T: Copy, O: RgbaSampleOutput<T>>(
 #[cfg(feature = "image-integration")]
 fn decode_avif_bytes_to_rgba8_slice(
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
     let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)
@@ -9264,7 +9333,7 @@ fn decode_avif_bytes_to_rgba8_slice(
 #[cfg(feature = "image-integration")]
 fn decode_avif_bytes_to_rgba16_native_endian_bytes(
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
     let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)
@@ -9470,7 +9539,7 @@ where
 #[cfg(feature = "image-integration")]
 fn try_decode_uncompressed_heif_to_rgba_output<T: Copy, O: RgbaSampleOutput<T>>(
     input: &[u8],
-    guardrails: &DecodeGuardrails,
+    guardrails: &DecodeOptions,
     out: &mut O,
     storage_bit_depth: u8,
     scale_sample: fn(u16, u8) -> T,
@@ -9558,7 +9627,7 @@ fn try_decode_uncompressed_heif_to_rgba_output<T: Copy, O: RgbaSampleOutput<T>>(
 #[cfg(feature = "image-integration")]
 fn decode_heif_bytes_to_rgba8_slice(
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
     preextracted: Option<isobmff::HeicPrimaryItemDataWithGrid>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
@@ -9585,7 +9654,7 @@ fn decode_heif_bytes_to_rgba8_slice(
 #[cfg(feature = "image-integration")]
 fn decode_heif_bytes_to_rgba16_native_endian_bytes(
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
     preextracted: Option<isobmff::HeicPrimaryItemDataWithGrid>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
@@ -9631,7 +9700,7 @@ type HeicCodedSliceDecode<T> = fn(
 #[cfg(feature = "image-integration")]
 fn decode_heif_bytes_to_rgba_slice<T>(
     input: &[u8],
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
     preextracted: Option<isobmff::HeicPrimaryItemDataWithGrid>,
     out: &mut [T],
     decode_grid_slice: HeicGridSliceDecode<T>,
@@ -9649,6 +9718,19 @@ fn decode_heif_bytes_to_rgba_slice<T>(
         None => isobmff::extract_primary_heic_item_data_with_grid(input)
             .map_err(DecodeHeicError::from)?,
     };
+
+    memory::heic(
+        input,
+        &mut source,
+        &primary_with_grid,
+        &guardrails,
+        false,
+        if guardrails.max_memory_bytes.is_some() {
+            primary_icc_profile_from_heic(input).map_or(0, |profile| profile.len() as u64)
+        } else {
+            0
+        },
+    )?;
 
     match primary_with_grid {
         isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
@@ -9677,9 +9759,10 @@ fn decode_heif_bytes_to_rgba_slice<T>(
 fn enforce_and_resolve_input_family(
     input: &[u8],
     hint: Option<HeifInputFamily>,
-    guardrails: &DecodeGuardrails,
+    guardrails: &DecodeOptions,
 ) -> Result<HeifInputFamily, DecodeError> {
     guardrails.enforce_input_bytes(input.len() as u64)?;
+    memory::validate_input(input, guardrails)?;
     detect_input_family_from_ftyp(input)
         .or(hint)
         .ok_or_else(unknown_input_family_error)
@@ -9696,10 +9779,27 @@ fn unknown_input_family_error() -> DecodeError {
 fn decode_bytes_to_rgba_layout_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<RgbaLayoutProbe, DecodeError> {
     match enforce_and_resolve_input_family(input, hint, &guardrails)? {
-        HeifInputFamily::Heif => decode_heif_bytes_to_rgba_layout(input, guardrails),
+        HeifInputFamily::Heif => {
+            let primary = if guardrails.max_memory_bytes.is_some() {
+                let primary = isobmff::extract_primary_heic_item_data_with_grid(input)
+                    .map_err(DecodeHeicError::from)?;
+                memory::heic(
+                    input,
+                    &mut None,
+                    &primary,
+                    &guardrails,
+                    false,
+                    primary_icc_profile_from_heic(input).map_or(0, |profile| profile.len() as u64),
+                )?;
+                Some(primary)
+            } else {
+                None
+            };
+            decode_heif_bytes_to_rgba_layout(input, guardrails, primary)
+        }
         HeifInputFamily::Avif => decode_avif_bytes_to_rgba_layout(input, guardrails)
             .map(RgbaLayoutProbe::without_extraction),
     }
@@ -9709,7 +9809,7 @@ fn decode_bytes_to_rgba_layout_with_hint_and_guardrails(
 fn decode_bytes_to_rgba8_slice_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
     preextracted_heic: Option<isobmff::HeicPrimaryItemDataWithGrid>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
@@ -9725,7 +9825,7 @@ fn decode_bytes_to_rgba8_slice_with_hint_and_guardrails(
 fn decode_bytes_to_rgba16_native_endian_bytes_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
     preextracted_heic: Option<isobmff::HeicPrimaryItemDataWithGrid>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
@@ -9750,7 +9850,7 @@ fn decode_bytes_to_rgba16_native_endian_bytes_with_hint_and_guardrails(
 fn decode_avif_bytes_to_png(
     input: &[u8],
     output_path: &Path,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<(), DecodeError> {
     let decoded = decode_avif_bytes_to_rgba(input, guardrails)?;
     write_decoded_rgba_image_to_png(&decoded, output_path)
@@ -9759,10 +9859,16 @@ fn decode_avif_bytes_to_png(
 fn decode_heif_bytes_to_png(
     input: &[u8],
     output_path: &Path,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<(), DecodeError> {
-    let decoded = decode_heif_bytes_to_rgba(input, guardrails)?;
-    write_decoded_rgba_image_to_png(&decoded, output_path)
+    let encoded_input_bytes = input.len() as u64;
+    let decoded = decode_heif_bytes_to_rgba(input, guardrails.clone())?;
+    write_decoded_rgba_image_to_png_with_input(
+        &decoded,
+        output_path,
+        encoded_input_bytes,
+        &guardrails,
+    )
 }
 
 fn extension_family_hint(path: &Path) -> Option<HeifInputFamily> {
@@ -10021,7 +10127,8 @@ fn detect_input_family_from_ftyp(input: &[u8]) -> Option<HeifInputFamily> {
 /// Default values are fully unbounded (`None` for all fields). For production
 /// environments, set explicit limits.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DecodeGuardrails {
+pub struct DecodeOptions {
+    pub max_memory_bytes: Option<u64>,
     /// Optional maximum accepted input size in bytes for all decode entry points.
     pub max_input_bytes: Option<u64>,
     /// Optional maximum decoded image area in pixels before RGBA materialization.
@@ -10032,7 +10139,54 @@ pub struct DecodeGuardrails {
     pub temp_spool_directory: Option<PathBuf>,
 }
 
+/// Legacy limit set retained for existing callers; converts into
+/// [`DecodeOptions`] with no aggregate memory budget. New callers should use
+/// [`DecodeOptions`] and [`DecodeOptions::for_platform()`] instead.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DecodeGuardrails {
+    /// Optional maximum accepted input size in bytes for all decode entry points.
+    pub max_input_bytes: Option<u64>,
+    /// Optional maximum decoded image area in pixels before RGBA materialization.
+    pub max_pixels: Option<u64>,
+    /// Optional maximum temp-spool size in bytes for non-seek `Read` ingestion.
+    pub max_temp_spool_bytes: Option<u64>,
+    /// Optional directory for temp-spool files created for non-seek input.
+    pub temp_spool_directory: Option<PathBuf>,
+}
+
 impl DecodeGuardrails {
+    pub fn with_memory_budget(self, max_memory_bytes: u64) -> DecodeOptions {
+        DecodeOptions {
+            max_memory_bytes: Some(max_memory_bytes),
+            ..self.into()
+        }
+    }
+}
+
+impl From<DecodeGuardrails> for DecodeOptions {
+    fn from(guardrails: DecodeGuardrails) -> Self {
+        Self {
+            max_memory_bytes: None,
+            max_input_bytes: guardrails.max_input_bytes,
+            max_pixels: guardrails.max_pixels,
+            max_temp_spool_bytes: guardrails.max_temp_spool_bytes,
+            temp_spool_directory: guardrails.temp_spool_directory,
+        }
+    }
+}
+
+impl DecodeOptions {
+    pub fn for_platform() -> Self {
+        let mobile = cfg!(any(target_os = "android", target_os = "ios"));
+        Self {
+            max_memory_bytes: Some(if mobile { 256 } else { 512 } * 1024 * 1024),
+            max_input_bytes: Some(128 * 1024 * 1024),
+            max_pixels: Some(if mobile { 64_000_000 } else { 256_000_000 }),
+            max_temp_spool_bytes: Some(128 * 1024 * 1024),
+            temp_spool_directory: None,
+        }
+    }
+
     fn enforce_input_bytes(&self, actual_bytes: u64) -> Result<(), DecodeError> {
         if let Some(max_input_bytes) = self.max_input_bytes
             && actual_bytes > max_input_bytes
@@ -10043,7 +10197,10 @@ impl DecodeGuardrails {
             }
             .into());
         }
-        Ok(())
+        memory::enforce(
+            self,
+            actual_bytes.saturating_mul(memory::INPUT_STORAGE_COPIES),
+        )
     }
 
     fn enforce_pixel_count(&self, width: u32, height: u32) -> Result<(), DecodeError> {
@@ -10073,7 +10230,7 @@ impl DecodeGuardrails {
 fn decode_bytes_to_rgba_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     match enforce_and_resolve_input_family(input, hint, &guardrails)? {
         HeifInputFamily::Avif => decode_avif_bytes_to_rgba(input, guardrails),
@@ -10084,7 +10241,7 @@ fn decode_bytes_to_rgba_with_hint_and_guardrails(
 fn decode_bytes_to_rgb8_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbImage, DecodeError> {
     match enforce_and_resolve_input_family(input, hint, &guardrails)? {
         HeifInputFamily::Heif => decode_heif_bytes_to_rgb8(input, guardrails),
@@ -10098,7 +10255,7 @@ fn decode_bytes_to_png_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
     output_path: &Path,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<(), DecodeError> {
     match enforce_and_resolve_input_family(input, hint, &guardrails)? {
         HeifInputFamily::Avif => decode_avif_bytes_to_png(input, output_path, guardrails),
@@ -10140,13 +10297,14 @@ fn decode_error_from_source_read_error(err: SourceReadError) -> DecodeError {
 fn decode_source_to_rgba_with_hint_and_guardrails<S: RandomAccessSource>(
     source: &mut S,
     hint: Option<HeifInputFamily>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     guardrails.enforce_input_bytes(source.len())?;
     let selected =
         read_selected_top_level_boxes_from_source(source, &[FTYP_BOX_TYPE, META_BOX_TYPE])?;
     let source_family_hint = detect_input_family_from_source_selected_boxes(&selected)?;
     let input = encode_source_selected_top_level_boxes(&selected);
+    memory::validate_input(&input, &guardrails)?;
     let family = source_family_hint
         .or(hint)
         .ok_or_else(unknown_input_family_error)?;
@@ -10159,13 +10317,14 @@ fn decode_source_to_rgba_with_hint_and_guardrails<S: RandomAccessSource>(
 fn decode_source_to_rgb8_with_hint_and_guardrails<S: RandomAccessSource>(
     source: &mut S,
     hint: Option<HeifInputFamily>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbImage, DecodeError> {
     guardrails.enforce_input_bytes(source.len())?;
     let selected =
         read_selected_top_level_boxes_from_source(source, &[FTYP_BOX_TYPE, META_BOX_TYPE])?;
     let source_family_hint = detect_input_family_from_source_selected_boxes(&selected)?;
     let input = encode_source_selected_top_level_boxes(&selected);
+    memory::validate_input(&input, &guardrails)?;
     match source_family_hint
         .or(hint)
         .ok_or_else(unknown_input_family_error)?
@@ -10181,16 +10340,16 @@ fn decode_source_to_png_with_hint_and_guardrails<S: RandomAccessSource>(
     source: &mut S,
     hint: Option<HeifInputFamily>,
     output_path: &Path,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<(), DecodeError> {
-    let decoded = decode_source_to_rgba_with_hint_and_guardrails(source, hint, guardrails)?;
-    write_decoded_rgba_image_to_png(&decoded, output_path)
+    let decoded = decode_source_to_rgba_with_hint_and_guardrails(source, hint, guardrails.clone())?;
+    write_decoded_rgba_image_to_png_with_input(&decoded, output_path, 0, &guardrails)
 }
 
 fn decode_read_to_rgba_with_hint_and_guardrails<R: Read>(
     input_reader: R,
     hint: Option<HeifInputFamily>,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     let mut source = TempFileSpoolSource::from_reader_with_options(
         input_reader,
@@ -10204,7 +10363,7 @@ fn decode_read_to_png_with_hint_and_guardrails<R: Read>(
     input_reader: R,
     hint: Option<HeifInputFamily>,
     output_path: &Path,
-    guardrails: DecodeGuardrails,
+    guardrails: DecodeOptions,
 ) -> Result<(), DecodeError> {
     let mut source = TempFileSpoolSource::from_reader_with_options(
         input_reader,
@@ -10219,12 +10378,19 @@ pub fn decode_bytes_to_rgba_with_guardrails(
     input: &[u8],
     guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_bytes_to_rgba_with_options(input, guardrails.into())
+}
+
+pub fn decode_bytes_to_rgba_with_options(
+    input: &[u8],
+    guardrails: DecodeOptions,
+) -> Result<DecodedRgbaImage, DecodeError> {
     decode_bytes_to_rgba_with_hint_and_guardrails(input, None, guardrails)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from bytes into an owned RGBA buffer.
 pub fn decode_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
-    decode_bytes_to_rgba_with_guardrails(input, DecodeGuardrails::default())
+    decode_bytes_to_rgba_with_options(input, DecodeOptions::default())
 }
 
 /// Decode coded HEIC/HEIF bytes directly into RGB8, intentionally discarding
@@ -10233,12 +10399,19 @@ pub fn decode_bytes_to_rgb8_with_guardrails(
     input: &[u8],
     guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbImage, DecodeError> {
+    decode_bytes_to_rgb8_with_options(input, guardrails.into())
+}
+
+pub fn decode_bytes_to_rgb8_with_options(
+    input: &[u8],
+    guardrails: DecodeOptions,
+) -> Result<DecodedRgbImage, DecodeError> {
     decode_bytes_to_rgb8_with_hint_and_guardrails(input, Some(HeifInputFamily::Heif), guardrails)
 }
 
 /// Decode coded HEIC/HEIF bytes directly into an owned RGB8 buffer.
 pub fn decode_bytes_to_rgb8(input: &[u8]) -> Result<DecodedRgbImage, DecodeError> {
-    decode_bytes_to_rgb8_with_guardrails(input, DecodeGuardrails::default())
+    decode_bytes_to_rgb8_with_options(input, DecodeOptions::default())
 }
 
 /// Decode a `Read` source with configurable guardrails into an owned RGBA buffer.
@@ -10246,18 +10419,32 @@ pub fn decode_read_to_rgba_with_guardrails<R: Read>(
     input_reader: R,
     guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_read_to_rgba_with_options(input_reader, guardrails.into())
+}
+
+pub fn decode_read_to_rgba_with_options<R: Read>(
+    input_reader: R,
+    guardrails: DecodeOptions,
+) -> Result<DecodedRgbaImage, DecodeError> {
     decode_read_to_rgba_with_hint_and_guardrails(input_reader, None, guardrails)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from a `Read` input into an owned RGBA buffer.
 pub fn decode_read_to_rgba<R: Read>(input_reader: R) -> Result<DecodedRgbaImage, DecodeError> {
-    decode_read_to_rgba_with_guardrails(input_reader, DecodeGuardrails::default())
+    decode_read_to_rgba_with_options(input_reader, DecodeOptions::default())
 }
 
 /// Decode a `BufRead` source with configurable guardrails into an owned RGBA buffer.
 pub fn decode_bufread_to_rgba_with_guardrails<R: BufRead>(
     input_reader: R,
     guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_bufread_to_rgba_with_options(input_reader, guardrails.into())
+}
+
+pub fn decode_bufread_to_rgba_with_options<R: BufRead>(
+    input_reader: R,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     decode_read_to_rgba_with_hint_and_guardrails(input_reader, None, guardrails)
 }
@@ -10266,13 +10453,20 @@ pub fn decode_bufread_to_rgba_with_guardrails<R: BufRead>(
 pub fn decode_bufread_to_rgba<R: BufRead>(
     input_reader: R,
 ) -> Result<DecodedRgbaImage, DecodeError> {
-    decode_bufread_to_rgba_with_guardrails(input_reader, DecodeGuardrails::default())
+    decode_bufread_to_rgba_with_options(input_reader, DecodeOptions::default())
 }
 
 /// Decode `input_path` with configurable guardrails into an owned RGBA buffer.
 pub fn decode_path_to_rgba_with_guardrails(
     input_path: &Path,
     guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_path_to_rgba_with_options(input_path, guardrails.into())
+}
+
+pub fn decode_path_to_rgba_with_options(
+    input_path: &Path,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     if !input_path.exists() {
         return Err(DecodeError::Unsupported(format!(
@@ -10290,7 +10484,7 @@ pub fn decode_path_to_rgba_with_guardrails(
 
 /// Decode a HEIF/HEIC/AVIF image from `input_path` into an owned RGBA buffer.
 pub fn decode_path_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, DecodeError> {
-    decode_path_to_rgba_with_guardrails(input_path, DecodeGuardrails::default())
+    decode_path_to_rgba_with_options(input_path, DecodeOptions::default())
 }
 
 /// Decode a coded HEIC/HEIF path directly into RGB8 with configurable
@@ -10298,6 +10492,13 @@ pub fn decode_path_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, Decode
 pub fn decode_path_to_rgb8_with_guardrails(
     input_path: &Path,
     guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbImage, DecodeError> {
+    decode_path_to_rgb8_with_options(input_path, guardrails.into())
+}
+
+pub fn decode_path_to_rgb8_with_options(
+    input_path: &Path,
+    guardrails: DecodeOptions,
 ) -> Result<DecodedRgbImage, DecodeError> {
     if !input_path.exists() {
         return Err(DecodeError::Unsupported(format!(
@@ -10315,7 +10516,7 @@ pub fn decode_path_to_rgb8_with_guardrails(
 
 /// Decode a coded HEIC/HEIF path directly into an owned RGB8 buffer.
 pub fn decode_path_to_rgb8(input_path: &Path) -> Result<DecodedRgbImage, DecodeError> {
-    decode_path_to_rgb8_with_guardrails(input_path, DecodeGuardrails::default())
+    decode_path_to_rgb8_with_options(input_path, DecodeOptions::default())
 }
 
 /// Backward-compatible alias for [`decode_path_to_rgba`].
@@ -10329,12 +10530,20 @@ pub fn decode_bytes_to_png_with_guardrails(
     output_path: &Path,
     guardrails: DecodeGuardrails,
 ) -> Result<(), DecodeError> {
+    decode_bytes_to_png_with_options(input, output_path, guardrails.into())
+}
+
+pub fn decode_bytes_to_png_with_options(
+    input: &[u8],
+    output_path: &Path,
+    guardrails: DecodeOptions,
+) -> Result<(), DecodeError> {
     decode_bytes_to_png_with_hint_and_guardrails(input, None, output_path, guardrails)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from bytes and write a PNG to `output_path`.
 pub fn decode_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
-    decode_bytes_to_png_with_guardrails(input, output_path, DecodeGuardrails::default())
+    decode_bytes_to_png_with_options(input, output_path, DecodeOptions::default())
 }
 
 /// Decode a `Read` source with configurable guardrails and write a PNG.
@@ -10343,12 +10552,20 @@ pub fn decode_read_to_png_with_guardrails<R: Read>(
     output_path: &Path,
     guardrails: DecodeGuardrails,
 ) -> Result<(), DecodeError> {
+    decode_read_to_png_with_options(input_reader, output_path, guardrails.into())
+}
+
+pub fn decode_read_to_png_with_options<R: Read>(
+    input_reader: R,
+    output_path: &Path,
+    guardrails: DecodeOptions,
+) -> Result<(), DecodeError> {
     decode_read_to_png_with_hint_and_guardrails(input_reader, None, output_path, guardrails)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from a `Read` input and write a PNG to `output_path`.
 pub fn decode_read_to_png<R: Read>(input_reader: R, output_path: &Path) -> Result<(), DecodeError> {
-    decode_read_to_png_with_guardrails(input_reader, output_path, DecodeGuardrails::default())
+    decode_read_to_png_with_options(input_reader, output_path, DecodeOptions::default())
 }
 
 /// Decode a `BufRead` source with configurable guardrails and write a PNG.
@@ -10356,6 +10573,14 @@ pub fn decode_bufread_to_png_with_guardrails<R: BufRead>(
     input_reader: R,
     output_path: &Path,
     guardrails: DecodeGuardrails,
+) -> Result<(), DecodeError> {
+    decode_bufread_to_png_with_options(input_reader, output_path, guardrails.into())
+}
+
+pub fn decode_bufread_to_png_with_options<R: BufRead>(
+    input_reader: R,
+    output_path: &Path,
+    guardrails: DecodeOptions,
 ) -> Result<(), DecodeError> {
     decode_read_to_png_with_hint_and_guardrails(input_reader, None, output_path, guardrails)
 }
@@ -10365,7 +10590,7 @@ pub fn decode_bufread_to_png<R: BufRead>(
     input_reader: R,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
-    decode_bufread_to_png_with_guardrails(input_reader, output_path, DecodeGuardrails::default())
+    decode_bufread_to_png_with_options(input_reader, output_path, DecodeOptions::default())
 }
 
 /// Decode `input_path` with configurable guardrails and write a PNG to `output_path`.
@@ -10373,6 +10598,14 @@ pub fn decode_path_to_png_with_guardrails(
     input_path: &Path,
     output_path: &Path,
     guardrails: DecodeGuardrails,
+) -> Result<(), DecodeError> {
+    decode_path_to_png_with_options(input_path, output_path, guardrails.into())
+}
+
+pub fn decode_path_to_png_with_options(
+    input_path: &Path,
+    output_path: &Path,
+    guardrails: DecodeOptions,
 ) -> Result<(), DecodeError> {
     if !input_path.exists() {
         return Err(DecodeError::Unsupported(format!(
@@ -10391,7 +10624,7 @@ pub fn decode_path_to_png_with_guardrails(
 
 /// Decode a HEIF/HEIC/AVIF image from `input_path` and write a PNG to `output_path`.
 pub fn decode_path_to_png(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
-    decode_path_to_png_with_guardrails(input_path, output_path, DecodeGuardrails::default())
+    decode_path_to_png_with_options(input_path, output_path, DecodeOptions::default())
 }
 
 /// Backward-compatible alias for [`decode_path_to_png`].
@@ -10399,7 +10632,18 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
     decode_path_to_png(input_path, output_path)
 }
 
-/// Write an already-decoded RGBA image buffer to PNG.
+/// Write an already-decoded RGBA image buffer to PNG, admitting the PNG
+/// encoding stage against `options.max_memory_bytes` before the output file is
+/// created.
+pub fn write_decoded_rgba_to_png_with_options(
+    decoded: &DecodedRgbaImage,
+    output_path: &Path,
+    options: DecodeOptions,
+) -> Result<(), DecodeError> {
+    write_decoded_rgba_image_to_png_with_input(decoded, output_path, 0, &options)
+}
+
+/// Write an already-decoded RGBA image buffer to PNG without memory admission.
 pub fn write_decoded_rgba_to_png(
     decoded: &DecodedRgbaImage,
     output_path: &Path,
@@ -11079,6 +11323,16 @@ fn decoded_uncompressed_to_rgba_image(
     })
 }
 
+fn write_decoded_rgba_image_to_png_with_input(
+    decoded: &DecodedRgbaImage,
+    output_path: &Path,
+    input_bytes: u64,
+    options: &DecodeOptions,
+) -> Result<(), DecodeError> {
+    memory::png(options, decoded, input_bytes)?;
+    write_decoded_rgba_image_to_png(decoded, output_path)
+}
+
 fn write_decoded_rgba_image_to_png(
     decoded: &DecodedRgbaImage,
     output_path: &Path,
@@ -11100,29 +11354,23 @@ fn write_decoded_rgba_image_to_png(
             // alpha channel for opaque images, and downstream 16-to-8
             // conversion expects opaque == 65535).
             let shift = 16_u32.saturating_sub(u32::from(decoded.source_bit_depth));
-            if shift > 0 {
-                let mask = u16::MAX << shift;
-                let masked: Vec<u16> = pixels
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &v)| if i % 4 == 3 { v } else { v & mask })
-                    .collect();
-                write_rgba16_png(
-                    decoded.width,
-                    decoded.height,
-                    &masked,
-                    decoded.icc_profile.as_deref(),
-                    output_path,
-                )
-            } else {
-                write_rgba16_png(
-                    decoded.width,
-                    decoded.height,
-                    pixels,
-                    decoded.icc_profile.as_deref(),
-                    output_path,
-                )
+            let mask = u16::MAX << shift;
+            let mut bytes = Vec::with_capacity(pixels.len() * 2);
+            for (i, &sample) in pixels.iter().enumerate() {
+                let value = if shift > 0 && i % 4 != 3 {
+                    sample & mask
+                } else {
+                    sample
+                };
+                bytes.extend_from_slice(&value.to_be_bytes());
             }
+            write_rgba16_png_bytes(
+                decoded.width,
+                decoded.height,
+                &bytes,
+                decoded.icc_profile.as_deref(),
+                output_path,
+            )
         }
     }
 }
@@ -11912,10 +12160,10 @@ fn write_rgba8_png(
     Ok(())
 }
 
-fn write_rgba16_png(
+fn write_rgba16_png_bytes(
     width: u32,
     height: u32,
-    pixels: &[u16],
+    bytes: &[u8],
     icc_profile: Option<&[u8]>,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
@@ -11931,19 +12179,7 @@ fn write_rgba16_png(
     )?;
     let mut png_writer = encoder.write_header()?;
 
-    let byte_len = pixels
-        .len()
-        .checked_mul(2)
-        .ok_or(DecodeError::OutputBufferOverflow {
-            buffer_name: "RGBA16 PNG byte buffer",
-            element_count: pixels.len(),
-            element_size_bytes: 2,
-        })?;
-    let mut bytes = Vec::with_capacity(byte_len);
-    for sample in pixels {
-        bytes.extend_from_slice(&sample.to_be_bytes());
-    }
-    png_writer.write_image_data(&bytes)?;
+    png_writer.write_image_data(bytes)?;
 
     Ok(())
 }
@@ -15022,7 +15258,7 @@ mod tests {
         let layout = super::decode_bytes_to_rgba_layout_with_hint_and_guardrails(
             &file,
             None,
-            super::DecodeGuardrails::default(),
+            super::DecodeOptions::default(),
         )
         .expect("layout probe must accept uncompressed HEIF")
         .layout;
@@ -15040,7 +15276,7 @@ mod tests {
         super::decode_bytes_to_rgba8_slice_with_hint_and_guardrails(
             &file,
             None,
-            super::DecodeGuardrails::default(),
+            super::DecodeOptions::default(),
             None,
             &mut rgba8,
         )

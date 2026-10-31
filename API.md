@@ -31,11 +31,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 ## Core Types
 
-- `DecodeGuardrails`
+- `DecodeOptions`
+  - `max_memory_bytes: Option<u64>`
   - `max_input_bytes: Option<u64>`
   - `max_pixels: Option<u64>`
   - `max_temp_spool_bytes: Option<u64>`
   - `temp_spool_directory: Option<PathBuf>`
+- `DecodeGuardrails` retains the input, pixel and spool fields above for existing callers.
 - `DecodedRgbaImage`
   - `width`, `height`
   - `source_bit_depth`
@@ -58,19 +60,26 @@ Result<DecodedRgbaImage, DecodeError>
 
 ### RGBA output
 
-- `decode_bytes_to_rgba_with_guardrails(input, guardrails)`
-- `decode_read_to_rgba_with_guardrails(reader, guardrails)`
-- `decode_bufread_to_rgba_with_guardrails(bufread, guardrails)`
-- `decode_path_to_rgba_with_guardrails(path, guardrails)`
+- `decode_bytes_to_rgba_with_options(input, guardrails)`
+- `decode_read_to_rgba_with_options(reader, guardrails)`
+- `decode_bufread_to_rgba_with_options(bufread, guardrails)`
+- `decode_path_to_rgba_with_options(path, guardrails)`
 
-Non-guardrailed convenience variants also exist (`decode_*_to_rgba`) and use `DecodeGuardrails::default()`.
+Non-guardrailed convenience variants also exist (`decode_*_to_rgba`) and use `DecodeOptions::default()`.
+
+### RGB8 output
+
+- `decode_bytes_to_rgb8_with_options(input, guardrails)` -> `DecodedRgbImage`
+- `decode_path_to_rgb8_with_options(path, guardrails)` -> `DecodedRgbImage`
+
+Convenience variants (`decode_bytes_to_rgb8`, `decode_path_to_rgb8`) exist for coded HEIC/HEIF input.
 
 ### PNG output
 
-- `decode_bytes_to_png_with_guardrails(input, output_path, guardrails)`
-- `decode_read_to_png_with_guardrails(reader, output_path, guardrails)`
-- `decode_bufread_to_png_with_guardrails(bufread, output_path, guardrails)`
-- `decode_path_to_png_with_guardrails(input_path, output_path, guardrails)`
+- `decode_bytes_to_png_with_options(input, output_path, guardrails)`
+- `decode_read_to_png_with_options(reader, output_path, guardrails)`
+- `decode_bufread_to_png_with_options(bufread, output_path, guardrails)`
+- `decode_path_to_png_with_options(input_path, output_path, guardrails)`
 
 Legacy aliases:
 
@@ -98,9 +107,9 @@ Also note:
 
 Use this decision order:
 
-1. If you already have `&[u8]`, use `decode_bytes_to_rgba_with_guardrails`.
-2. If you have a file path, use `decode_path_to_rgba_with_guardrails`.
-3. If you have `Read`/`BufRead` (non-seek stream), use `decode_read_to_rgba_with_guardrails` or `decode_bufread_to_rgba_with_guardrails`.
+1. If you already have `&[u8]`, use `decode_bytes_to_rgba_with_options`.
+2. If you have a file path, use `decode_path_to_rgba_with_options`.
+3. If you have `Read`/`BufRead` (non-seek stream), use `decode_read_to_rgba_with_options` or `decode_bufread_to_rgba_with_options`.
 
 Important behavior:
 
@@ -114,9 +123,10 @@ Use explicit guardrails in production.
 Example preset:
 
 ```rust
-use heic_decoder::DecodeGuardrails;
+use heic_decoder::DecodeOptions;
 
-let guardrails = DecodeGuardrails {
+let guardrails = DecodeOptions {
+    max_memory_bytes: DecodeOptions::for_platform().max_memory_bytes,
     max_input_bytes: Some(128 * 1024 * 1024),
     max_pixels: Some(64_000_000),
     max_temp_spool_bytes: Some(128 * 1024 * 1024),
@@ -126,6 +136,57 @@ let guardrails = DecodeGuardrails {
 
 Notes:
 
+- `max_memory_bytes` opts HEVC-backed HEIC into an aggregate preflight budget.
+  The estimate includes resident encoded storage and parsed container tables, native planes and slice maps,
+  the bounded tile working set, alpha, output and transform buffers, and room
+  for two RGB buffers with growth headroom and an ICC conversion destination. ICC profiles also
+  reserve profile storage and 16 MiB for conversion setup. The check runs before
+  pixel decoding, including before the image hook advertises its output layout.
+  Container tables and selected encoded payloads are checked before materialization.
+  Materialized item payloads reserve six times their extent lengths, covering
+  extraction, stream assembly and HEVC parameter-set parsing scratch (RBSP removal
+  buffers and removed-position tracking with growth headroom).
+  Grid codec tables and transforms are charged per tile reference. Every input
+  entry point initially requires three times the full input/source length to fit
+  the allowance, so the effective input cap is at most one third of that budget.
+  The later path/source estimate reserves twice the full source length plus
+  selected metadata storage and further decode reservations, even when only
+  selected boxes and item payloads are loaded.
+- `DecodeOptions::for_platform()` supplies a 256 MiB estimate limit on Android
+  and iOS, or 512 MiB elsewhere, plus input, pixel and spool limits. These are
+  conservative admission policies, not process RSS or device-memory guarantees.
+  A valid image can be rejected when its combined estimate exceeds the budget.
+- The aggregate policy currently supports HEVC-backed HEIC, including grids and
+  alpha. AVIF and uncompressed HEIF return `UnsupportedFeature` when it is
+  enabled. Default guardrails keep their existing unbounded behavior.
+- Assembled HEVC streams are always decoded with fixed four-byte
+  length-prefixed framing, matching every estimator and metadata walker.
+  Streams whose first NAL unit is 1 byte or 256-511 bytes long were previously
+  re-detected as Annex B start-code data, which could decode hidden parameter
+  sets embedded anywhere in the stream and bypass pixel and aggregate limits;
+  those streams now decode strictly by their length prefixes. This is a
+  deliberate change to option-less decode results for such malformed inputs:
+  files that previously failed or decoded attacker-chosen hidden geometry now
+  either decode their visible parameter sets or fail cleanly.
+- Existing `DecodeGuardrails` literals and `*_with_guardrails` signatures are
+  unchanged. New `*_with_options` entry points accept `DecodeOptions`.
+  `DecodeGuardrails::with_memory_budget(bytes)` also creates options from an
+  existing preset. Production HEIC callers must adopt the new options or the
+  platform preset to enable aggregate admission checks.
+- Budgeted `*_to_png` operations and `write_decoded_rgba_to_png_with_options`
+  additionally admit the PNG write before the output file is created: the retained
+  decoded image, one big-endian sample buffer for 16-bit output, three times the
+  raw filtered PNG stream (covering compressed-output growth), two encoder row
+  buffers, five times the ICC profile (retained capacity, encoder copy and
+  compressed-profile growth), the resident encoded input on the bytes route, and
+  a fixed 512 KiB encoder allowance. At the mobile preset this admits roughly
+  6.5 MP of 10/12-bit and larger 8-bit PNG outputs; tighter allowances reject
+  before writing.
+- The budget applies to one decode and its estimated conversion buffers.
+  Callers must limit simultaneous decodes and reserve additional memory for
+  their JPEG encoder, retained results and Dart/native image decoding. Subtract
+  those reservations from the decoder allowance; this crate cannot enforce
+  allocations made by the application after returning the image.
 - `max_input_bytes` applies to all entry points.
 - `max_temp_spool_bytes` protects non-seek `Read`/`BufRead` ingestion.
 - `max_pixels` checks AV1 and HEVC coded frame area before pixel decoding,
@@ -204,7 +265,10 @@ Default decode behavior:
 Orientation APIs:
 
 - `exif_orientation_hint(input_bytes)` -> `ExifOrientationHint`
+- `exif_orientation_hint_with_options(input_bytes, options)` -> `Result<ExifOrientationHint, DecodeError>`
 - `exif_orientation_hint_from_path(input_path)` -> `Result<ExifOrientationHint, DecodeError>`
+- `exif_orientation_hint_from_path_with_options(input_path, options)` -> `Result<ExifOrientationHint, DecodeError>`
+
 - `primary_exif_orientation(input_bytes)` -> `Option<u8>`
 - `primary_exif_orientation_from_path(input_path)` -> `Result<Option<u8>, DecodeError>`
 - `primary_item_has_orientation_transform(input_bytes)` -> `bool`
@@ -212,17 +276,21 @@ Orientation APIs:
 - `path_extension_is_heif_family(path)` -> `bool`
 - `DecodedRgbaImage::apply_exif_orientation(exif_orientation)` -> `Result<DecodedRgbaImage, DecodeError>`
 
+Budgeted image hooks check linked EXIF candidates and the returned TIFF copy
+when metadata is requested. The budgeted byte and path hints perform the same admission;
+subtract any live decoded pixels and application buffers from its allowance.
+
 Recommended pattern:
 
 ```rust
-use heic_decoder::{decode_path_to_rgba, exif_orientation_hint};
+use heic_decoder::{DecodeOptions, decode_path_to_rgba_with_options, exif_orientation_hint_from_path_with_options};
 use std::path::Path;
 
 fn decode_with_explicit_orientation(path: &Path) -> Result<(), heic_decoder::DecodeError> {
-    let input = std::fs::read(path).map_err(heic_decoder::DecodeError::Io)?;
-    let hint = exif_orientation_hint(&input);
+    let options = DecodeOptions::for_platform();
+    let hint = exif_orientation_hint_from_path_with_options(path, options.clone())?;
 
-    let decoded = decode_path_to_rgba(path)?;
+    let decoded = decode_path_to_rgba_with_options(path, options)?;
     let decoded = if let Some(orientation) = hint.orientation_to_apply() {
         decoded.apply_exif_orientation(orientation)?
     } else {
@@ -234,17 +302,22 @@ fn decode_with_explicit_orientation(path: &Path) -> Result<(), heic_decoder::Dec
 }
 ```
 
+Reading the hint from the path before decoding avoids buffering the whole file; when a
+post-decode hint is unavoidable, subtract the live decoded pixel and ICC capacities from
+the hint's allowance first, as the CLI does.
+
 Path-only variant (no full input read, no image decode):
 
 ```rust
-use heic_decoder::{exif_orientation_hint_from_path, path_extension_is_heif};
+use heic_decoder::{DecodeOptions, exif_orientation_hint_from_path_with_options, path_extension_is_heif};
 use std::path::Path;
 
 fn orientation_to_apply(path: &Path) -> Result<Option<u8>, heic_decoder::DecodeError> {
     if !path_extension_is_heif(path) {
         return Ok(None);
     }
-    Ok(exif_orientation_hint_from_path(path)?.orientation_to_apply())
+    Ok(exif_orientation_hint_from_path_with_options(path, DecodeOptions::for_platform())?
+        .orientation_to_apply())
 }
 ```
 
@@ -259,19 +332,23 @@ single grid-tile scratch buffer may still be allocated.
 `register_image_decoder_hooks()` caps the encoded input buffer at
 `DEFAULT_HOOK_MAX_INPUT_BYTES` (128 MiB); register with explicit guardrails
 to choose a different `max_input_bytes` bound (or `None` for unbounded).
+With an aggregate allowance, encoded buffering is also capped at one third of
+`max_memory_bytes`; the smaller encoded-input limit applies.
 
 ### 1) Register hooks once at startup
 
 ```rust
-use heic_decoder::DecodeGuardrails;
-use heic_decoder::image_integration::register_image_decoder_hooks_with_guardrails;
+use heic_decoder::DecodeOptions;
+use heic_decoder::image_integration::register_image_decoder_hooks_with_options;
 
-let registration = register_image_decoder_hooks_with_guardrails(DecodeGuardrails {
+let options = DecodeOptions {
+    max_memory_bytes: DecodeOptions::for_platform().max_memory_bytes,
     max_input_bytes: Some(128 * 1024 * 1024),
     max_pixels: Some(64_000_000),
     max_temp_spool_bytes: Some(128 * 1024 * 1024),
     temp_spool_directory: None,
-});
+};
+let registration = register_image_decoder_hooks_with_options(options.clone());
 
 assert!(registration.any_decoder_hook_registered());
 ```
@@ -280,11 +357,11 @@ assert!(registration.any_decoder_hook_registered());
 
 ```rust
 use image::ImageReader;
-use heic_decoder::exif_orientation_hint;
+use heic_decoder::exif_orientation_hint_with_options;
 use heic_decoder::image_integration::apply_exif_orientation_dynamic;
 
 let bytes = std::fs::read("input.heic").map_err(image::ImageError::IoError)?;
-let hint = exif_orientation_hint(&bytes);
+let hint = exif_orientation_hint_with_options(&bytes, options.clone())?;
 
 let img = ImageReader::new(std::io::Cursor::new(&bytes))
     .with_guessed_format()?
@@ -334,7 +411,7 @@ Additional helper under `image-integration`:
 
 For reliable agent behavior:
 
-1. Always use `*_with_guardrails` APIs for untrusted input.
+1. Always use `*_with_options` APIs for untrusted input.
 2. Treat `Read`/`BufRead` as temp-spooled random-access decode, not progressive decode.
 3. Branch on `decoded.storage_bit_depth()` and avoid implicit down-conversion.
 4. Match `DecodeError::category()` for stable retry/reject decisions.
@@ -344,18 +421,19 @@ For reliable agent behavior:
 ## Minimal End-to-End Example
 
 ```rust
-use heic_decoder::{decode_path_to_rgba_with_guardrails, DecodeGuardrails};
+use heic_decoder::{decode_path_to_rgba_with_options, DecodeOptions};
 use std::path::Path;
 
 fn decode(path: &Path) -> Result<(), heic_decoder::DecodeError> {
-    let guardrails = DecodeGuardrails {
+    let guardrails = DecodeOptions {
+        max_memory_bytes: DecodeOptions::for_platform().max_memory_bytes,
         max_input_bytes: Some(128 * 1024 * 1024),
         max_pixels: Some(64_000_000),
         max_temp_spool_bytes: Some(128 * 1024 * 1024),
         temp_spool_directory: None,
     };
 
-    let decoded = decode_path_to_rgba_with_guardrails(path, guardrails)?;
+    let decoded = decode_path_to_rgba_with_options(path, guardrails)?;
     eprintln!(
         "decoded {}x{}, storage={}bit, source={}bit",
         decoded.width,
