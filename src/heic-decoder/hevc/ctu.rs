@@ -421,16 +421,32 @@ impl<'a> SliceContext<'a> {
         self.map_origin = origin;
         frame.advance_rows(origin);
         self.ctb_y = row;
-        for x in 0..self.sps.pic_width_in_ctbs() {
+        let width = self.sps.pic_width_in_ctbs();
+        let last_row = row + 1 == self.sps.pic_height_in_ctbs();
+        let wavefront = self.pps.entropy_coding_sync_enabled_flag;
+        let mut synced = None;
+        for x in 0..width {
             self.ctb_x = x;
             *self.sao_map.get_mut(x, row) = super::sao::SaoInfo::default();
             self.decode_ctu(x * size, row * size, frame)?;
+            if wavefront && x == 1 {
+                synced = Some(self.ctx);
+            }
             let end = self.cabac.decode_terminate() != 0;
             self.cabac.check_input()?;
-            let last =
-                row + 1 == self.sps.pic_height_in_ctbs() && x + 1 == self.sps.pic_width_in_ctbs();
-            if end != last {
+            if end != (last_row && x + 1 == width) {
                 return Err(HevcError::InvalidBitstream("incremental slice termination"));
+            }
+        }
+        if wavefront && !last_row {
+            self.cabac.decode_terminate();
+            match self.header.entry_point_offsets.get(row as usize) {
+                Some(&offset) => self.cabac.seek_to(offset as usize)?,
+                None => self.cabac.reinit(),
+            }
+            match synced {
+                Some(contexts) => self.ctx = contexts,
+                None => self.reinit_context_models(),
             }
         }
         Ok(())

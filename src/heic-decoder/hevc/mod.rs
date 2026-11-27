@@ -132,16 +132,11 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
     Ok(frame)
 }
 
-fn decode_slice(
+pub(crate) fn adjust_entry_points(
     nal: &bitstream::NalUnit<'_>,
-    sps: &params::Sps,
-    pps: &params::Pps,
-    frame: &mut DecodedFrame,
+    data_offset: usize,
+    header: &mut slice::SliceHeader,
 ) -> Result<()> {
-    let parse_result = slice::SliceHeader::parse(nal, sps, pps)?;
-    let mut slice_header = parse_result.header;
-    let data_offset = parse_result.data_offset;
-
     // Entry point offsets count transmitted bytes (including emulation
     // prevention bytes), but the CABAC decoder reads the stripped payload, so
     // each offset shrinks by the number of EPBs removed from the slice data
@@ -154,7 +149,7 @@ fn decode_slice(
     // stripped slot, so it must not be counted. (libde265 compares mixed
     // coordinates with an inclusive bound here; both differences only show
     // for EPBs at the header tail or exactly on a substream boundary.)
-    if !slice_header.entry_point_offsets.is_empty() && !nal.skipped_byte_positions.is_empty() {
+    if !header.entry_point_offsets.is_empty() && !nal.skipped_byte_positions.is_empty() {
         let header_epbs = nal
             .skipped_byte_positions
             .iter()
@@ -162,7 +157,7 @@ fn decode_slice(
             .take_while(|&(index, &pos)| (pos as usize) < data_offset + index)
             .count();
         let slice_data_start = (data_offset + header_epbs) as u32;
-        for offset in slice_header.entry_point_offsets.iter_mut() {
+        for offset in header.entry_point_offsets.iter_mut() {
             let skipped = nal
                 .skipped_byte_positions
                 .iter()
@@ -176,6 +171,20 @@ fn decode_slice(
             *offset -= skipped;
         }
     }
+    Ok(())
+}
+
+fn decode_slice(
+    nal: &bitstream::NalUnit<'_>,
+    sps: &params::Sps,
+    pps: &params::Pps,
+    frame: &mut DecodedFrame,
+) -> Result<()> {
+    let parse_result = slice::SliceHeader::parse(nal, sps, pps)?;
+    let mut slice_header = parse_result.header;
+    let data_offset = parse_result.data_offset;
+
+    adjust_entry_points(nal, data_offset, &mut slice_header)?;
 
     if !slice_header.slice_type.is_intra() {
         return Err(HevcError::Unsupported(

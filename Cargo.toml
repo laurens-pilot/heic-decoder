@@ -9,7 +9,8 @@ repository = "https://github.com/ente-io/heic-decoder"
 
 [features]
 incremental-experiment = []
-default = ["std", "parallel-grid"]
+default = ["std", "parallel-grid", "avif"]
+avif = ["dep:rav1d"]
 decoder-tracing = ["std"]
 image-integration = ["dep:image"]
 parallel-grid = ["std", "dep:rayon"]
@@ -29,7 +30,7 @@ libc = "0.2"
 moxcms = "0.9.1"
 png = "0.18"
 rayon = { version = "1.10", optional = true }
-rav1d = { git = "https://github.com/ente-io/rav1d.git", branch = "arm32_stable", default-features = false, features = [
+rav1d = { git = "https://github.com/ente-io/rav1d.git", branch = "arm32_stable", optional = true, default-features = false, features = [
     "bitdepth_8",
     "bitdepth_16",
 ] }

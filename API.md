@@ -13,8 +13,9 @@ This document is the practical API reference for integrating `heic_decoder` in a
 
 ## Feature Flags
 
-- `default`: no optional features.
+- `default`: `std`, `parallel-grid` and `avif`.
 - `image-integration`: enables `heic_decoder::image_integration` module and hook APIs.
+- `avif` (default): AVIF decoding through rav1d. Without it, AVIF decodes return `DecodeAvifError::DecoderUnavailable`, the `image` hooks leave AVIF to other decoders, and with default features off the crate builds for 32-bit targets without 64-bit atomics, such as `xtensa-esp32s3-espidf`.
 
 `Cargo.toml`:
 
@@ -497,6 +498,25 @@ once, so a large non-grid image needs a larger budget than a grid of the same
 size. Grid tile payloads are limited to 16 MiB; a single image's payload is
 bounded by the budget and the 512 MiB input limit. Admission is conservative,
 and allocator overhead and process RSS are not included.
+
+## Row decoding
+
+`rows::info(config, payload)` and `rows::decode_rows(config, payload, emit)`
+work on one HEVC coded item, such as a single grid tile. `config` is the
+item's `hvcC` property payload and `payload` is its length-prefixed item data.
+The item must be 8-bit 4:2:0 HEVC with one IDR slice; WPP is supported, HEVC
+tiles are not. `Info` reports the display and coded sizes, the conformance
+window `crop` (left, right, top, bottom) and the colour signalling.
+`decode_rows` calls `emit` with each `Band` from top to bottom. `top` and
+`rows` count coded luma rows; `luma` holds `rows` rows of `luma_stride`
+samples, and `cb` and `cr` hold the matching half-height chroma rows of
+`chroma_stride` samples. Bands are one CTU tall, except possibly the last, and
+borrow decoder buffers for the duration of the call. Errors are
+`BoundedDecodeError`. No cropping, transforms, or colour conversion are
+applied, and no memory budget is enforced: working memory is a copy of the
+payload, four bytes for each emulation prevention byte removed from it, and a
+few CTU rows of coded width. `info` prepares the slice the same way before it
+returns.
 
 ## Experimental incremental bounded decoding
 

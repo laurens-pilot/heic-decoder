@@ -136,11 +136,13 @@ impl<'a> Prepared<'a> {
         mut emit: impl FnMut(u32, &DecodedFrame) -> Result<()>,
     ) -> Result<super::incremental::Statistics> {
         let parsed = SliceHeader::parse_bounded(&self.slice, &self.sps, &self.pps)?;
-        super::incremental::decode(
+        let mut header = parsed.header;
+        super::adjust_entry_points(&self.slice, parsed.data_offset, &mut header)?;
+        super::incremental::decode_slice_data(
             &self.sps,
             &self.pps,
-            &parsed.header,
-            &mut std::io::Cursor::new(&self.slice.payload[parsed.data_offset..]),
+            &header,
+            &self.slice.payload[parsed.data_offset..],
             |start, frame| emit(start, frame),
         )
     }

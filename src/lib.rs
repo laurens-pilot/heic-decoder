@@ -7,17 +7,22 @@ use moxcms::{
     CicpColorPrimaries, CicpProfile, ColorProfile, LocalizableString, MatrixCoefficients,
     ProfileText, TransferCharacteristics, Xyzd,
 };
-#[cfg(feature = "image-integration")]
+#[cfg(all(feature = "avif", feature = "image-integration"))]
 use rav1d::dav1d_parse_sequence_header;
+#[cfg(feature = "avif")]
 use rav1d::include::dav1d::data::Dav1dData;
+#[cfg(feature = "avif")]
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
-#[cfg(feature = "image-integration")]
+#[cfg(all(feature = "avif", feature = "image-integration"))]
 use rav1d::include::dav1d::headers::Dav1dSequenceHeader;
+#[cfg(feature = "avif")]
 use rav1d::include::dav1d::headers::{
     DAV1D_PIXEL_LAYOUT_I400, DAV1D_PIXEL_LAYOUT_I420, DAV1D_PIXEL_LAYOUT_I422,
     DAV1D_PIXEL_LAYOUT_I444,
 };
+#[cfg(feature = "avif")]
 use rav1d::include::dav1d::picture::Dav1dPicture;
+#[cfg(feature = "avif")]
 use rav1d::{
     Dav1dResult, Rav1dError, dav1d_close, dav1d_data_create, dav1d_data_unref,
     dav1d_default_settings, dav1d_get_picture, dav1d_open, dav1d_picture_unref, dav1d_send_data,
@@ -28,16 +33,20 @@ use source::{
 };
 use std::borrow::Cow;
 use std::error::Error;
+#[cfg(feature = "avif")]
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Read};
+#[cfg(feature = "avif")]
 use std::mem::MaybeUninit;
 #[cfg(feature = "parallel-grid")]
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "avif")]
 use std::ptr::{self, NonNull};
 
+#[cfg(feature = "avif")]
 mod av1_geometry;
 mod bounded;
 mod chroma_upsampling;
@@ -52,7 +61,7 @@ pub use bounded::incremental::decode as decode_incremental_experiment;
 #[path = "heic-decoder/mod.rs"]
 mod heic_decoder;
 pub use bounded::{
-    BoundedDecodeError, BoundedDecodeOptions, BoundedInput, BoundedRgbImage, decode_bounded,
+    BoundedDecodeError, BoundedDecodeOptions, BoundedInput, BoundedRgbImage, decode_bounded, rows,
 };
 #[cfg(feature = "image-integration")]
 pub mod image_integration;
@@ -843,6 +852,7 @@ pub enum DecodeAvifError {
         matrix_coefficients: u16,
     },
     MissingSequenceHeader,
+    DecoderUnavailable,
 }
 
 impl DecodeAvifError {
@@ -857,9 +867,8 @@ impl DecodeAvifError {
             | DecodeAvifError::DecoderNoFrameOutput => DecodeErrorCategory::DecoderBackend,
             DecodeAvifError::UnsupportedBitDepth { .. }
             | DecodeAvifError::UnsupportedPixelLayout { .. }
-            | DecodeAvifError::UnsupportedMatrixCoefficients { .. } => {
-                DecodeErrorCategory::UnsupportedFeature
-            }
+            | DecodeAvifError::UnsupportedMatrixCoefficients { .. }
+            | DecodeAvifError::DecoderUnavailable => DecodeErrorCategory::UnsupportedFeature,
             DecodeAvifError::InvalidImageGeometry { .. }
             | DecodeAvifError::MissingPlane { .. }
             | DecodeAvifError::PlaneStrideOverflow { .. }
@@ -975,6 +984,9 @@ impl Display for DecodeAvifError {
                 f,
                 "AVIF nclx matrix_coefficients {matrix_coefficients} is not supported for YCbCr->RGB conversion"
             ),
+            DecodeAvifError::DecoderUnavailable => {
+                write!(f, "AVIF decoding requires the avif feature")
+            }
         }
     }
 }
@@ -13969,9 +13981,11 @@ fn scale_heic_sample_to_image_rgb8(sample: u16, bit_depth: u8) -> u8 {
     ((u32::from(scale_sample_to_u16(sample, bit_depth)) + 128) / 257) as u8
 }
 
+#[cfg(feature = "avif")]
 #[derive(Default)]
 struct DecoderContextGuard(Option<Dav1dContext>);
 
+#[cfg(feature = "avif")]
 impl Drop for DecoderContextGuard {
     fn drop(&mut self) {
         // SAFETY: `dav1d_close` accepts a pointer to optional context and
@@ -13980,9 +13994,11 @@ impl Drop for DecoderContextGuard {
     }
 }
 
+#[cfg(feature = "avif")]
 #[derive(Default)]
 struct DecoderDataGuard(Dav1dData);
 
+#[cfg(feature = "avif")]
 impl Drop for DecoderDataGuard {
     fn drop(&mut self) {
         // SAFETY: `dav1d_data_unref` accepts initialized/default `Dav1dData`
@@ -13991,9 +14007,11 @@ impl Drop for DecoderDataGuard {
     }
 }
 
+#[cfg(feature = "avif")]
 #[derive(Default)]
 struct DecoderPictureGuard(Dav1dPicture);
 
+#[cfg(feature = "avif")]
 impl Drop for DecoderPictureGuard {
     fn drop(&mut self) {
         // SAFETY: `dav1d_picture_unref` accepts initialized/default
@@ -14002,7 +14020,7 @@ impl Drop for DecoderPictureGuard {
     }
 }
 
-#[cfg(feature = "image-integration")]
+#[cfg(all(feature = "avif", feature = "image-integration"))]
 fn av1_sequence_header_bit_depth(obus: &[u8]) -> Option<u8> {
     if obus.is_empty() {
         return None;
@@ -14029,6 +14047,16 @@ fn av1_sequence_header_bit_depth(obus: &[u8]) -> Option<u8> {
     })
 }
 
+#[cfg(all(not(feature = "avif"), feature = "image-integration"))]
+fn avif_probe_source_bit_depth(
+    _: &[u8],
+    _: &isobmff::MetaBox<'_>,
+    _: &isobmff::ResolvedPrimaryItemGraph<'_>,
+    _: &[u8],
+) -> Result<u8, DecodeAvifError> {
+    Err(DecodeAvifError::DecoderUnavailable)
+}
+
 /// Coded bit depth for the AVIF layout probe, read from the actual AV1
 /// sequence header rather than the av1C flags. The slice decode validates
 /// its output depth against the decoded frame (and the direct API trusts
@@ -14036,7 +14064,7 @@ fn av1_sequence_header_bit_depth(obus: &[u8]) -> Option<u8> {
 /// coded stream would advertise a layout `read_image` then rejects. The
 /// sequence header normally sits in av1C's configOBUs; fall back to the
 /// primary item payload when it is not there.
-#[cfg(feature = "image-integration")]
+#[cfg(all(feature = "avif", feature = "image-integration"))]
 fn avif_probe_source_bit_depth(
     input: &[u8],
     meta: &isobmff::MetaBox<'_>,
@@ -14058,6 +14086,16 @@ fn avif_probe_source_bit_depth(
     av1_sequence_header_bit_depth(&payload).ok_or(DecodeAvifError::MissingSequenceHeader)
 }
 
+#[cfg(not(feature = "avif"))]
+fn decode_av1_bitstream_to_image(
+    _: &[u8],
+    _: Option<(u32, u32)>,
+    _: Option<u64>,
+) -> Result<DecodedAvifImage, DecodeAvifError> {
+    Err(DecodeAvifError::DecoderUnavailable)
+}
+
+#[cfg(feature = "avif")]
 fn decode_av1_bitstream_to_image(
     bitstream: &[u8],
     expected: Option<(u32, u32)>,
@@ -14164,6 +14202,7 @@ fn decode_av1_bitstream_to_image(
     Err(DecodeAvifError::DecoderNoFrameOutput)
 }
 
+#[cfg(feature = "avif")]
 fn ensure_dav1d_ok(stage: &'static str, result: Dav1dResult) -> Result<(), DecodeAvifError> {
     if result.0 == 0 {
         Ok(())
@@ -14175,6 +14214,7 @@ fn ensure_dav1d_ok(stage: &'static str, result: Dav1dResult) -> Result<(), Decod
     }
 }
 
+#[cfg(feature = "avif")]
 fn picture_to_internal_image(picture: &Dav1dPicture) -> Result<DecodedAvifImage, DecodeAvifError> {
     let width = u32::try_from(picture.p.w).map_err(|_| DecodeAvifError::InvalidImageGeometry {
         width: picture.p.w,
@@ -14291,6 +14331,7 @@ fn picture_to_internal_image(picture: &Dav1dPicture) -> Result<DecodedAvifImage,
     })
 }
 
+#[cfg(feature = "avif")]
 fn decode_layout_from_dav1d(layout: u32) -> Result<AvifPixelLayout, DecodeAvifError> {
     if layout == DAV1D_PIXEL_LAYOUT_I400 {
         Ok(AvifPixelLayout::Yuv400)
@@ -14314,6 +14355,7 @@ fn chroma_dimensions(width: u32, height: u32, layout: AvifPixelLayout) -> (u32, 
     }
 }
 
+#[cfg(feature = "avif")]
 fn copy_plane_samples(
     plane_ptr: NonNull<c_void>,
     stride: isize,
@@ -14951,7 +14993,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "image-integration")]
+    #[cfg(all(feature = "avif", feature = "image-integration"))]
     #[test]
     fn av1_sequence_header_bit_depth_reads_coded_depth() {
         // Minimal monochrome reduced-still-picture sequence-header OBUs,
