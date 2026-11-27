@@ -19,13 +19,16 @@ use std::sync::Once;
 
 const HOOK_EXTENSION_HEIC: &str = "heic";
 const HOOK_EXTENSION_HEIF: &str = "heif";
+#[cfg(feature = "avif")]
 const HOOK_EXTENSION_AVIF: &str = "avif";
 
 const FTYP_MASK_12: [u8; 12] = [
     0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 ];
 
+#[cfg(feature = "avif")]
 const FTYP_SIG_AVIF: [u8; 12] = *b"\0\0\0\0ftypavif";
+#[cfg(feature = "avif")]
 const FTYP_SIG_AVIS: [u8; 12] = *b"\0\0\0\0ftypavis";
 
 const FTYP_SIG_HEIC: [u8; 12] = *b"\0\0\0\0ftypheic";
@@ -275,7 +278,7 @@ impl ImageHookRegistration {
     pub fn all_decoder_hooks_registered(self) -> bool {
         self.heic_decoder_hook_registered
             && self.heif_decoder_hook_registered
-            && self.avif_decoder_hook_registered
+            && (self.avif_decoder_hook_registered || !cfg!(feature = "avif"))
     }
 }
 
@@ -311,6 +314,9 @@ pub fn register_image_decoder_hooks_with_guardrails(
             )
         }),
     );
+    #[cfg(not(feature = "avif"))]
+    let avif_decoder_hook_registered = false;
+    #[cfg(feature = "avif")]
     let avif_decoder_hook_registered = hooks::register_decoding_hook(
         OsString::from(HOOK_EXTENSION_AVIF),
         Box::new(move |reader| {
@@ -332,16 +338,19 @@ pub fn register_image_decoder_hooks_with_guardrails(
 }
 
 fn register_image_format_detection_hooks() {
-    hooks::register_format_detection_hook(
-        OsString::from(HOOK_EXTENSION_AVIF),
-        &FTYP_SIG_AVIF,
-        Some(&FTYP_MASK_12),
-    );
-    hooks::register_format_detection_hook(
-        OsString::from(HOOK_EXTENSION_AVIF),
-        &FTYP_SIG_AVIS,
-        Some(&FTYP_MASK_12),
-    );
+    #[cfg(feature = "avif")]
+    {
+        hooks::register_format_detection_hook(
+            OsString::from(HOOK_EXTENSION_AVIF),
+            &FTYP_SIG_AVIF,
+            Some(&FTYP_MASK_12),
+        );
+        hooks::register_format_detection_hook(
+            OsString::from(HOOK_EXTENSION_AVIF),
+            &FTYP_SIG_AVIS,
+            Some(&FTYP_MASK_12),
+        );
+    }
 
     hooks::register_format_detection_hook(
         OsString::from(HOOK_EXTENSION_HEIF),
@@ -830,5 +839,15 @@ mod tests {
             .read_image_boxed(&mut pixels)
             .expect("decode should use the bytes the reader actually yields");
         assert_eq!(pixels, expected_rgba);
+    }
+
+    #[test]
+    fn avif_decoder_hook_is_registered_only_with_the_avif_feature() {
+        let registration = super::register_image_decoder_hooks();
+        assert_eq!(
+            registration.avif_decoder_hook_registered,
+            cfg!(feature = "avif")
+        );
+        assert!(registration.all_decoder_hooks_registered());
     }
 }
