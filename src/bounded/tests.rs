@@ -1983,3 +1983,141 @@ fn ordered_tile_decoding_propagates_tile_panics_alongside_tile_errors() {
         assert!(outcome.is_err(), "tile {panicking}");
     }
 }
+
+#[cfg(not(feature = "decoder-tracing"))]
+fn primary_coded_items(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let budget = memory::Budget::new(128 * 1024 * 1024);
+    let mut source = container::Source::new(BoundedInput::Bytes(bytes)).unwrap();
+    let metadata = source.metadata(&budget).unwrap();
+    let index = container::Index::parse(&metadata, source.len(), &budget).unwrap();
+    let primary = &index.items[index.primary];
+    let items: Vec<usize> = if &primary.kind == b"grid" {
+        index
+            .references
+            .iter()
+            .find(|reference| &reference.kind == b"dimg" && reference.from == primary.id)
+            .unwrap()
+            .targets()
+            .map(|id| index.item(id).unwrap())
+            .collect()
+    } else {
+        vec![index.primary]
+    };
+    items
+        .into_iter()
+        .map(|item| {
+            let (_, config) = index
+                .properties(item)
+                .find(|(_, property)| &property.kind == b"hvcC")
+                .unwrap();
+            let mut payload = vec![0; index.items[item].location.unwrap().length];
+            index.read_item(item, &mut source, &mut payload).unwrap();
+            (config.data.to_vec(), payload)
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+fn uses_wavefront(config: &[u8]) -> bool {
+    let (nals, _) = codec::configuration(config).unwrap();
+    let pps =
+        crate::heic_decoder::hevc::bitstream::parse_single_nal_bounded(nals.parameters[2].unwrap())
+            .unwrap();
+    crate::heic_decoder::hevc::params::parse_pps_bounded(&pps.payload)
+        .unwrap()
+        .entropy_coding_sync_enabled_flag
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+fn assert_rows_match_whole_decode(config: &[u8], payload: &[u8]) -> u32 {
+    let whole = codec::prepare(config, payload).unwrap().decode().unwrap();
+    let info = rows::info(config, payload).unwrap();
+    assert_eq!(
+        (info.coded_width, info.coded_height),
+        (whole.width, whole.height)
+    );
+    assert_eq!(
+        (info.width, info.height),
+        (whole.cropped_width(), whole.cropped_height())
+    );
+    let mut bands = 0;
+    let mut next = 0;
+    rows::decode_rows(config, payload, |band| {
+        assert_eq!(band.top, next);
+        assert_eq!(band.width, whole.width);
+        for (component, samples, stride) in [
+            (0, band.luma, band.luma_stride),
+            (1, band.cb, band.chroma_stride),
+            (2, band.cr, band.chroma_stride),
+        ] {
+            let (expected, expected_stride) = whole.plane(component);
+            let first = if component == 0 {
+                band.top
+            } else {
+                band.top / 2
+            };
+            let rows = if component == 0 {
+                band.rows
+            } else {
+                band.rows.div_ceil(2)
+            };
+            assert_eq!(stride, expected_stride);
+            assert_eq!(samples.len(), rows as usize * stride);
+            assert!(
+                samples == &expected[first as usize * stride..][..samples.len()],
+                "component {component} differs in rows from {}",
+                band.top
+            );
+        }
+        bands += 1;
+        next += band.rows;
+    })
+    .unwrap();
+    assert_eq!(next, whole.height);
+    bands
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn wavefront_row_bands_match_whole_tile_decodes() {
+    let fixtures: [(&[u8], usize); 4] = [
+        (include_bytes!("testdata/apple-semantic-mattes.heic"), 4),
+        (
+            include_bytes!("../testdata/apple-alpha-grid-1030x520.heic"),
+            6,
+        ),
+        (include_bytes!("../testdata/apple-alpha-192x64.heic"), 1),
+        (include_bytes!("../testdata/apple-alpha-40x30.heic"), 1),
+    ];
+    for (bytes, tiles) in fixtures {
+        let items = primary_coded_items(bytes);
+        assert_eq!(items.len(), tiles);
+        for (config, payload) in items {
+            assert!(uses_wavefront(&config));
+            let info = rows::info(&config, &payload).unwrap();
+            assert_eq!(
+                assert_rows_match_whole_decode(&config, &payload),
+                info.coded_height.div_ceil(32)
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn row_api_decodes_single_substream_slices_and_reports_errors() {
+    let nals = nal_sets();
+    let config = configuration(&nals[1]);
+    let payload = [
+        &(asymmetric_payload().len() as u32).to_be_bytes()[..],
+        &asymmetric_payload(),
+    ]
+    .concat();
+    assert!(!uses_wavefront(&config));
+    assert!(assert_rows_match_whole_decode(&config, &payload) > 0);
+    assert!(matches!(
+        rows::info(&config[..22], &payload),
+        Err(BoundedDecodeError::Malformed(_))
+    ));
+    assert!(rows::decode_rows(&config, &payload[..payload.len() - 8], |_| {}).is_err());
+}

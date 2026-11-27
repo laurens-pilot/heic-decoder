@@ -61,7 +61,7 @@ pub use bounded::incremental::decode as decode_incremental_experiment;
 #[path = "heic-decoder/mod.rs"]
 mod heic_decoder;
 pub use bounded::{
-    BoundedDecodeError, BoundedDecodeOptions, BoundedInput, BoundedRgbImage, decode_bounded,
+    BoundedDecodeError, BoundedDecodeOptions, BoundedInput, BoundedRgbImage, decode_bounded, rows,
 };
 #[cfg(feature = "image-integration")]
 pub mod image_integration;

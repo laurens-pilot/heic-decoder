@@ -7,6 +7,7 @@ mod grid;
 pub(crate) mod incremental;
 mod memory;
 mod resample;
+pub mod rows;
 #[cfg(test)]
 mod tests;
 
