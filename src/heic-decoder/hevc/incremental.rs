@@ -17,14 +17,40 @@ pub(crate) fn decode(
     pps: &Pps,
     header: &SliceHeader,
     data: &mut dyn std::io::Read,
-    mut emit: impl FnMut(u32, &mut DecodedFrame) -> Result<()>,
+    emit: impl FnMut(u32, &mut DecodedFrame) -> Result<()>,
 ) -> Result<Statistics> {
-    if pps.entropy_coding_sync_enabled_flag
-        || pps.tiles_enabled_flag
-        || !header.first_slice_segment_in_pic_flag
-    {
+    if pps.entropy_coding_sync_enabled_flag {
         return Err(HevcError::Unsupported("incremental coding structure"));
     }
+    ensure_supported(pps, header)?;
+    let context = SliceContext::new_stream(sps, pps, header, data, 2 * sps.ctb_size())?;
+    decode_rows(context, emit)
+}
+
+pub(crate) fn decode_slice_data(
+    sps: &Sps,
+    pps: &Pps,
+    header: &SliceHeader,
+    data: &[u8],
+    emit: impl FnMut(u32, &mut DecodedFrame) -> Result<()>,
+) -> Result<Statistics> {
+    ensure_supported(pps, header)?;
+    let context = SliceContext::new_with_height(sps, pps, header, data, 2 * sps.ctb_size())?;
+    decode_rows(context, emit)
+}
+
+fn ensure_supported(pps: &Pps, header: &SliceHeader) -> Result<()> {
+    if pps.tiles_enabled_flag || !header.first_slice_segment_in_pic_flag {
+        return Err(HevcError::Unsupported("incremental coding structure"));
+    }
+    Ok(())
+}
+
+fn decode_rows(
+    mut context: SliceContext<'_>,
+    mut emit: impl FnMut(u32, &mut DecodedFrame) -> Result<()>,
+) -> Result<Statistics> {
+    let (sps, pps, header) = (context.sps, context.pps, context.header);
     let size = sps.ctb_size();
     let width = sps.pic_width_in_luma_samples;
     let height = sps.pic_height_in_luma_samples;
@@ -36,7 +62,6 @@ pub(crate) fn decode(
     output.full_range = sps.video_full_range_flag;
     output.matrix_coeffs = sps.matrix_coeffs;
     output.colour_primaries = sps.colour_primaries;
-    let mut context = SliceContext::new_stream(sps, pps, header, data, 2 * size)?;
     let mut statistics = Statistics::default();
     for row in 0..sps.pic_height_in_ctbs() {
         let start = row * size;
