@@ -15,6 +15,7 @@ This document is the practical API reference for integrating `heic_decoder` in a
 
 - `default`: no optional features.
 - `image-integration`: enables `heic_decoder::image_integration` module and hook APIs.
+- `avif` (default): AVIF decoding through rav1d. Without it, AVIF decodes return `DecodeAvifError::DecoderUnavailable`, and with default features off the crate builds for 32-bit targets without 64-bit atomics, such as `xtensa-esp32s3-espidf`.
 
 `Cargo.toml`:
 

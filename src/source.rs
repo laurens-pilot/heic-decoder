@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub trait RandomAccessSource {
@@ -246,7 +246,7 @@ impl FileSource {
 }
 
 const TEMP_SPOOL_PREFIX: &str = "heic_decoder-spool";
-static TEMP_SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TEMP_SPOOL_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn next_temp_spool_path(directory: &Path) -> PathBuf {
     let nanos = SystemTime::now()

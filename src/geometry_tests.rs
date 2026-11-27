@@ -570,6 +570,7 @@ fn heic_matching_alpha_is_preserved() {
     );
 }
 
+#[cfg(feature = "avif")]
 #[test]
 fn avif_matching_alpha_is_preserved() {
     let input = image_fixture(
@@ -600,6 +601,7 @@ fn avif_matching_alpha_is_preserved() {
     );
 }
 
+#[cfg(feature = "avif")]
 #[test]
 fn avif_without_colr_reports_the_sequence_header_colour() {
     let input = image_fixture(
@@ -620,6 +622,7 @@ fn avif_without_colr_reports_the_sequence_header_colour() {
     );
 }
 
+#[cfg(feature = "avif")]
 #[test]
 fn avif_zero_pixel_limit_cannot_disable_backend_limit() {
     let input = image_fixture(
@@ -1104,6 +1107,7 @@ fn heic_grid_aggregate_budget_includes_every_tile() {
     ));
 }
 
+#[cfg(feature = "avif")]
 #[test]
 fn avif_coded_geometry_mismatch_is_checked_without_a_pixel_limit() {
     let input = image_fixture(
@@ -1127,6 +1131,25 @@ fn avif_coded_geometry_mismatch_is_checked_without_a_pixel_limit() {
         ))
     ));
     assert!(largest < 256 * 2048);
+}
+
+#[cfg(not(feature = "avif"))]
+#[test]
+fn avif_decoding_is_unavailable_without_the_avif_feature() {
+    let input = image_fixture(
+        b"av01",
+        (16, 16),
+        boxed(b"av1C", &[0x81, 0x04, 0x0c, 0]),
+        av1_payload(),
+        None,
+    );
+    let error =
+        decode_bytes_to_rgba_with_guardrails(&input, DecodeGuardrails::default()).unwrap_err();
+    assert!(matches!(
+        error,
+        DecodeError::AvifDecode(DecodeAvifError::DecoderUnavailable)
+    ));
+    assert_eq!(error.category(), DecodeErrorCategory::UnsupportedFeature);
 }
 
 fn bit_reader_ue(bits: &[bool], position: &mut usize) -> u32 {
